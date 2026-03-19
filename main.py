@@ -14,6 +14,7 @@ origins = [
     "https://cropydeals.cropgenapp.com",
     "https://app.cropgenapp.com",
     "https://soilsense.com",
+    "https://admin.cropgenapp.com",
 ]
 
 app.add_middleware(
