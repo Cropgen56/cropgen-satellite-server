@@ -6,6 +6,7 @@ import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from contextlib import nullcontext
+from functools import lru_cache
 
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -40,9 +41,39 @@ os.environ.setdefault("GDAL_CACHEMAX", "512")
 
 EARTH_SEARCH_AWS = "https://earth-search.aws.element84.com/v1"
 PLANETARY_STAC = "https://planetarycomputer.microsoft.com/api/stac/v1"
+SENTINEL1_COLLECTION = "sentinel-1-grd"
+SENTINEL2_COLLECTIONS = ["sentinel-2-l2a", "sentinel-2-l1c"]
 
 # default threads (reduce if network-bound)
 THREADS = min(4, (os.cpu_count() or 4))
+
+
+@lru_cache(maxsize=2)
+def get_planetary_client():
+    return Client.open(PLANETARY_STAC)
+
+
+@lru_cache(maxsize=2)
+def get_aws_client():
+    return Client.open(EARTH_SEARCH_AWS)
+
+
+def get_collections_for_satellite(satellite: str) -> List[str]:
+    sat = (satellite or "s2").lower()
+    if sat.startswith("s1"):
+        return [SENTINEL1_COLLECTION]
+    return SENTINEL2_COLLECTIONS
+
+
+def get_provider_search_order(provider: Optional[str], prefer_pc_default: bool = True) -> List[str]:
+    mode = (provider or "both").lower()
+    if mode in {"pc", "planetary", "planetary-computer"}:
+        return ["planetary"]
+    if mode == "aws":
+        return ["aws"]
+    if prefer_pc_default:
+        return ["planetary", "aws"]
+    return ["aws", "planetary"]
 
 # ---------- Palettes & labels ----------
 # Default palette and labels (using NDVI as fallback)
@@ -386,11 +417,11 @@ def read_scl_window(src, geom_sc, out_h, out_w, transform):
 
 # ---------- STAC helpers ----------
 def search_planetary(collections, intersects, dt, limit=50):
-    cat = Client.open(PLANETARY_STAC)
+    cat = get_planetary_client()
     return list(cat.search(collections=collections, intersects=intersects, datetime=dt, limit=limit).items())
 
 def search_aws(collections, intersects, dt, limit=50):
-    cat = Client.open(EARTH_SEARCH_AWS)
+    cat = get_aws_client()
     return list(cat.search(collections=collections, intersects=intersects, datetime=dt, limit=limit).items())
 
 def items_for_date(aoi_geojson, iso_dt, collection, prefer_pc=True, limit=6):
@@ -451,10 +482,7 @@ def quick_keep_pct(item, aoi_geojson):
 
 # pick best item
 def pick_best_item(aoi_geojson, start, end, prefer_pc=True, satellite="s2"):
-    if satellite and satellite.lower().startswith("s1"):
-        collections_try = ["sentinel-1"]
-    else:
-        collections_try = ["sentinel-2-l2a", "sentinel-2-l1c"]
+    collections_try = get_collections_for_satellite(satellite)
     items = []
     if prefer_pc:
         items = search_planetary(collections_try, aoi_geojson, f"{start}/{end}", limit=12)
@@ -505,9 +533,10 @@ def pick_best_item(aoi_geojson, start, end, prefer_pc=True, satellite="s2"):
     return best[1], best[2], get_collection_id(best[1])
 
 # read tile
-def _read_tile_into_stack(item, aoi_geojson, dst_transform, H, W, want_scl):
+def _read_tile_into_stack(item, aoi_geojson, dst_transform, H, W, want_scl, required_bands=None):
     out = {"used": False, "bands": {}, "S": None, "id": getattr(item, "id", None)}
     assets = item.assets or {}
+    required_bands = list(dict.fromkeys(required_bands or ["B04", "B08"]))
     # pick best asset href heuristically
     def first_asset_href(assets_dict):
         # try some known names then fall back to first valid href
@@ -524,41 +553,44 @@ def _read_tile_into_stack(item, aoi_geojson, dst_transform, H, W, want_scl):
                 return h
         return None
 
-    red_url = prefer_http_from_asset(assets.get("red") or assets.get("B04") or assets.get("RED") or first_asset_href(assets))
-    nir_url = prefer_http_from_asset(assets.get("nir") or assets.get("B08") or assets.get("NIR") or first_asset_href(assets))
-    if not (red_url and nir_url):
+    primary_asset = prefer_http_from_asset(
+        assets.get("red") or assets.get("B04") or assets.get("RED") or first_asset_href(assets)
+    )
+    if not primary_asset:
         return out
-    red_url = sign_href_if_pc(red_url); nir_url = sign_href_if_pc(nir_url)
     scl_ref = assets.get("scl") or assets.get("SCL")
     scl_url = prefer_http_from_asset(scl_ref) if (want_scl and scl_ref) else None
     scl_url = sign_href_if_pc(scl_url) if scl_url else None
     try:
-        with rasterio.open(red_url) as red, rasterio.open(nir_url) as nir, \
+        with rasterio.open(sign_href_if_pc(primary_asset)) as ref_ds, \
              (rasterio.open(scl_url) if scl_url else nullcontext()) as scl:
-            crs = red.crs or nir.crs
+            crs = ref_ds.crs
             aoi_sc = aoi_to_scene(aoi_geojson, crs.to_string())
-            R = read_band_window(red, aoi_sc, H, W, dst_transform, Resampling.bilinear)
-            N = read_band_window(nir, aoi_sc, H, W, dst_transform, Resampling.bilinear)
-            if np.nanmax(R) > 1.5 or np.nanmax(N) > 1.5:
-                R *= 1/10000.0; N *= 1/10000.0
             S = None
             if scl:
                 S = read_scl_window(scl, aoi_sc, H, W, dst_transform)
-            out.update({"used": True, "bands": {"B04": R, "B08": N}, "S": S})
-            for bkey in ("B03","B02","B11","B12","B05","B8A","B04","B08","B05"):
+            out["S"] = S
+
+            loaded_required = 0
+            for bkey in required_bands:
                 a = assets.get(bkey) or assets.get(bkey.lower())
-                if a:
-                    url = prefer_http_from_asset(a)
-                    if url:
-                        url = sign_href_if_pc(url)
-                        try:
-                            with rasterio.open(url) as ds:
-                                arr = read_band_window(ds, aoi_sc, H, W, dst_transform, Resampling.bilinear)
-                                if np.nanmax(arr) > 1.5:
-                                    arr *= 1/10000.0
-                                out["bands"][bkey] = arr
-                        except Exception:
-                            pass
+                if not a:
+                    continue
+                url = prefer_http_from_asset(a)
+                if not url:
+                    continue
+                url = sign_href_if_pc(url)
+                try:
+                    with rasterio.open(url) as ds:
+                        arr = read_band_window(ds, aoi_sc, H, W, dst_transform, Resampling.bilinear)
+                        if np.isfinite(arr).any() and np.nanmax(arr) > 1.5:
+                            arr *= 1 / 10000.0
+                        out["bands"][bkey] = arr
+                        loaded_required += 1
+                except Exception:
+                    out["bands"][bkey] = None
+
+            out["used"] = loaded_required > 0
             return out
     except Exception:
         return out

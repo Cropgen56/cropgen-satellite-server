@@ -39,9 +39,8 @@ def calculate_index(req: CalculateRequest):
         raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
 
     satellite = (req.satellite or "s2").lower()
-    prefer_pc = True
-    if req.provider and req.provider.lower() == "aws":
-        prefer_pc = False
+    search_order = utils.get_provider_search_order(req.provider, prefer_pc_default=True)
+    prefer_pc = search_order[0] == "planetary"
 
     # Sentinel-1 cannot compute optical indices like NDVI, EVI, etc.
     OPTICAL_INDICES = {
@@ -72,6 +71,7 @@ def calculate_index(req: CalculateRequest):
     }
     if index_name not in index_band_map:
         raise HTTPException(status_code=400, detail=f"Unsupported index: {index_name}")
+    required_bands = index_band_map[index_name]
 
     try:
         item, has_scl, coll = utils.pick_best_item(geom, date_str, date_str, prefer_pc=prefer_pc, satellite=satellite)
@@ -96,65 +96,68 @@ def calculate_index(req: CalculateRequest):
 
         aoi_sc, dst_transform, H, W, res_m = utils.build_adaptive_grid(target_crs, geom, native_res_m=10.0)
 
-        coll_name = coll or ("sentinel-2-l2a" if satellite.startswith("s2") else "sentinel-1")
+        coll_name = coll or utils.get_collections_for_satellite(satellite)[0]
         tiles = utils.items_for_date(geom, item.properties.get("datetime", ""), coll_name, prefer_pc=prefer_pc, limit=6) or [item]
 
         # precompute AOI mask (in scene CRS) for area stats & masking
         aoi_mask = geometry_mask([mapping(aoi_sc)], out_shape=(H, W), transform=dst_transform, invert=True)
 
-        R_stack = np.full((H, W), np.nan, dtype="float32")
-        N_stack = np.full((H, W), np.nan, dtype="float32")
+        band_stack = {
+            band: np.full((H, W), np.nan, dtype="float32")
+            for band in required_bands
+        }
         have_data = np.zeros((H, W), dtype=bool)
         S_stack = np.zeros((H, W), dtype="int16") if has_scl else None
 
         with ThreadPoolExecutor(max_workers=utils.THREADS) as ex:
-            futures = [ex.submit(utils._read_tile_into_stack, it, geom, dst_transform, H, W, S_stack is not None) for it in tiles]
+            futures = [
+                ex.submit(
+                    utils._read_tile_into_stack,
+                    it,
+                    geom,
+                    dst_transform,
+                    H,
+                    W,
+                    S_stack is not None,
+                    required_bands,
+                )
+                for it in tiles
+            ]
             for fut in as_completed(futures):
                 res = fut.result()
                 if not res.get("used"):
                     continue
                 bands = res["bands"]
-                R = bands.get("B04")
-                N = bands.get("B08")
                 S = res.get("S")
-                if R is None or N is None:
+                required_arrays = [bands.get(band) for band in required_bands]
+                if any(arr is None for arr in required_arrays):
                     continue
-                new_valid = np.isfinite(R) & np.isfinite(N)
+                new_valid = np.logical_and.reduce(
+                    [np.isfinite(arr) for arr in required_arrays]
+                )
                 take = new_valid & (~have_data)
                 if np.any(take):
-                    R_stack[take] = R[take]
-                    N_stack[take] = N[take]
+                    for band in required_bands:
+                        band_stack[band][take] = bands[band][take]
                     if S_stack is not None and S is not None:
                         S_stack[take] = S[take]
                     have_data |= take
 
-        # default NDVI arr (used if index is NDVI)
-        den = (N_stack + R_stack); den[den == 0] = np.nan
-        index_arr = (N_stack - R_stack) / den
-
-        # ensure band_dict contains all requested bands
-        band_dict = {"B04": R_stack, "B08": N_stack}
-        for key in index_band_map[index_name]:
-            if key not in band_dict:
-                a = item.assets.get(key) or item.assets.get(key.lower())
-                if a:
-                    url = utils.prefer_http_from_asset(a)
-                    if url:
-                        url = utils.sign_href_if_pc(url)
-                        try:
-                            with rasterio.open(url) as ds:
-                                arr = utils.read_band_window(ds, utils.aoi_to_scene(geom, ds.crs.to_string()), H, W, dst_transform, Resampling.bilinear)
-                                if np.nanmax(arr) > 1.5:
-                                    arr *= 1/10000.0
-                                band_dict[key] = arr
-                        except Exception:
-                            band_dict[key] = None
-                else:
-                    band_dict[key] = None
+        band_dict = dict(band_stack)
+        index_arr = None
+        if index_name != "TRUE_COLOR":
+            try:
+                index_arr = utils.compute_index_array_by_name(index_name, band_dict)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Index compute error: {e}")
 
         # coverage check
-        total_pixels = H * W
-        valid_pixels = np.count_nonzero(np.isfinite(index_arr) & aoi_mask)
+        if index_name == "TRUE_COLOR":
+            valid_pixels = np.count_nonzero(
+                np.logical_and.reduce([np.isfinite(band_dict[band]) for band in required_bands]) & aoi_mask
+            )
+        else:
+            valid_pixels = np.count_nonzero(np.isfinite(index_arr) & aoi_mask)
         valid_frac = valid_pixels / float(max(np.count_nonzero(aoi_mask), 1))
 
         if valid_frac < 0.7:
@@ -162,41 +165,60 @@ def calculate_index(req: CalculateRequest):
             s = (datetime.strptime(date_str, fmt) - timedelta(days=14)).strftime(fmt)
             e = (datetime.strptime(date_str, fmt) + timedelta(days=14)).strftime(fmt)
             items_extra = []
-            if prefer_pc:
-                items_extra = utils.search_planetary([coll_name], geom, f"{s}/{e}", limit=12)
-                if not items_extra:
-                    items_extra = utils.search_aws([coll_name], geom, f"{s}/{e}", limit=12)
-            else:
-                items_extra = utils.search_aws([coll_name], geom, f"{s}/{e}", limit=12)
-                if not items_extra:
+            for provider_name in search_order:
+                if provider_name == "planetary":
                     items_extra = utils.search_planetary([coll_name], geom, f"{s}/{e}", limit=12)
+                else:
+                    items_extra = utils.search_aws([coll_name], geom, f"{s}/{e}", limit=12)
+                if items_extra:
+                    break
             items_extra = [it for it in items_extra if getattr(it, "id", None) != getattr(item, "id", None)]
             try:
-                med_B04 = utils.temporal_fill_median("B04", items_extra, geom, dst_transform, H, W, want_scl=False, max_items=6)
-                med_B08 = utils.temporal_fill_median("B08", items_extra, geom, dst_transform, H, W, want_scl=False, max_items=6)
-                if med_B04 is not None and med_B08 is not None:
-                    fill_mask = (~np.isfinite(index_arr)) & aoi_mask
-                    both = np.isfinite(med_B04) & np.isfinite(med_B08)
-                    fill_here = fill_mask & both
+                median_bands = {}
+                for band in required_bands:
+                    median_bands[band] = utils.temporal_fill_median(
+                        band,
+                        items_extra,
+                        geom,
+                        dst_transform,
+                        H,
+                        W,
+                        want_scl=False,
+                        max_items=6,
+                    )
+
+                if all(median_bands[band] is not None for band in required_bands):
+                    if index_name == "TRUE_COLOR":
+                        fill_mask = (
+                            ~np.logical_and.reduce(
+                                [np.isfinite(band_dict[band]) for band in required_bands]
+                            )
+                        ) & aoi_mask
+                    else:
+                        fill_mask = (~np.isfinite(index_arr)) & aoi_mask
+
+                    valid_fill = np.logical_and.reduce(
+                        [np.isfinite(median_bands[band]) for band in required_bands]
+                    )
+                    fill_here = fill_mask & valid_fill
                     if np.any(fill_here):
-                        if np.nanmax(med_B04) > 1.5 or np.nanmax(med_B08) > 1.5:
-                            med_B04 = med_B04 * (1/10000.0)
-                            med_B08 = med_B08 * (1/10000.0)
-                        den2 = (med_B08 + med_B04); den2[den2 == 0] = np.nan
-                        index_arr[fill_here] = (med_B08[fill_here] - med_B04[fill_here]) / den2[fill_here]
-                        band_dict["B04"][fill_here] = med_B04[fill_here]
-                        band_dict["B08"][fill_here] = med_B08[fill_here]
-                        valid_pixels = np.count_nonzero(np.isfinite(index_arr) & aoi_mask)
+                        for band in required_bands:
+                            if np.isfinite(median_bands[band]).any() and np.nanmax(median_bands[band]) > 1.5:
+                                median_bands[band] = median_bands[band] * (1 / 10000.0)
+                            band_dict[band][fill_here] = median_bands[band][fill_here]
+
+                        if index_name != "TRUE_COLOR":
+                            index_arr = utils.compute_index_array_by_name(index_name, band_dict)
+                            valid_pixels = np.count_nonzero(np.isfinite(index_arr) & aoi_mask)
+                        else:
+                            valid_pixels = np.count_nonzero(
+                                np.logical_and.reduce(
+                                    [np.isfinite(band_dict[band]) for band in required_bands]
+                                ) & aoi_mask
+                            )
                         valid_frac = valid_pixels / float(max(np.count_nonzero(aoi_mask), 1))
             except Exception:
                 pass
-
-        # compute index if not NDVI or TRUE_COLOR
-        if index_name != "NDVI" and index_name != "TRUE_COLOR":
-            try:
-                index_arr = utils.compute_index_array_by_name(index_name, band_dict)
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Index compute error: {e}")
 
         if S_stack is not None:
             classes = [8, 9, 10, 11]

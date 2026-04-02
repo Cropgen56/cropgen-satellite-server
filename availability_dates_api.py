@@ -13,22 +13,26 @@ def availability(req: AvailabilityRequest):
         datetime.strptime(req.end_date, "%Y-%m-%d")
     except Exception:
         raise HTTPException(status_code=400, detail="start_date and end_date must be YYYY-MM-DD")
-    prefer_pc = True
-    if req.provider and req.provider.lower() == "aws":
-        prefer_pc = False
-    satellite = (req.satellite or "s2").lower()
-    coll_map = {
-    "s2": ["sentinel-2-l2a"],
-    "s1": ["sentinel-1-grd"] 
-    }
 
-    collections = coll_map.get(satellite, ["sentinel-2-l2a"])
+    collections = utils.get_collections_for_satellite(req.satellite or "s2")
+    search_order = utils.get_provider_search_order(req.provider, prefer_pc_default=True)
+
     try:
-        items_pc = utils.search_planetary(collections, geom, f"{req.start_date}/{req.end_date}", limit=500) if prefer_pc else []
-        items_aws = utils.search_aws(collections, geom, f"{req.start_date}/{req.end_date}", limit=500) if not prefer_pc else utils.search_aws(collections, geom, f"{req.start_date}/{req.end_date}", limit=500)
-        all_items = (items_pc or []) + (items_aws or [])
+        dt = f"{req.start_date}/{req.end_date}"
+        all_items = []
+        for provider_name in search_order:
+            if provider_name == "planetary":
+                items = utils.search_planetary(collections, geom, dt, limit=500)
+            else:
+                items = utils.search_aws(collections, geom, dt, limit=500)
+            if items:
+                all_items.extend(items)
+                # For default "both", use the first provider with results to avoid double-fetching.
+                break
+
         if not all_items:
             return {"items": []}
+
         date_map = {}
         for it in all_items:
             dt = it.properties.get("datetime") or it.properties.get("acquired") or ""
