@@ -33,6 +33,7 @@ default_origins = [
     "https://cropydeals.cropgenapp.com",
     "https://app.cropgenapp.com",
     "https://admin.cropgenapp.com",
+    "https://biodrops.cropgenapp.com",
 ]
 
 env_origins = [
