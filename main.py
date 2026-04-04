@@ -11,8 +11,16 @@ from auth import get_expected_api_key, validate_api_key
 
 load_dotenv(override=True)  # override=True ensures .env always wins over shell/conda env vars
 
-# Routes are mounted at /v4/api/... matching production nginx prefix.
-app = FastAPI()
+# Docs + OpenAPI must live under /v4/ so the browser requests /v4/openapi.json (same prefix as
+# /v4/docs). Default /openapi.json hits the site root and is often routed to the wrong upstream
+# (502 Bad Gateway). Nginx should forward full paths starting with /v4 to this app, e.g.:
+#   location /v4/ { proxy_pass http://127.0.0.1:8001; ... }   # no trailing slash after port
+app = FastAPI(
+    title="CropGen Satellite API",
+    docs_url="/v4/docs",
+    openapi_url="/v4/openapi.json",
+    redoc_url="/v4/redoc",
+)
 get_expected_api_key()
 
 default_origins = [
@@ -24,7 +32,6 @@ default_origins = [
     "http://127.0.0.1:5176",
     "https://cropydeals.cropgenapp.com",
     "https://app.cropgenapp.com",
-    "https://soilsense.com",
     "https://admin.cropgenapp.com",
 ]
 
