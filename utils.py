@@ -47,6 +47,27 @@ SENTINEL2_COLLECTIONS = ["sentinel-2-l2a", "sentinel-2-l1c"]
 # default threads (reduce if network-bound)
 THREADS = min(4, (os.cpu_count() or 4))
 
+# Best-effort diagnostics to explain provider fallback failures.
+_PROVIDER_ERRORS: Dict[str, str] = {}
+
+def _set_provider_error(provider: str, err: Exception) -> None:
+    _PROVIDER_ERRORS[provider] = str(err)
+
+def _clear_provider_error(provider: str) -> None:
+    _PROVIDER_ERRORS.pop(provider, None)
+
+def get_provider_error_summary() -> str:
+    if not _PROVIDER_ERRORS:
+        return ""
+    ordered = []
+    for p in ("planetary", "aws"):
+        if p in _PROVIDER_ERRORS:
+            ordered.append(f"{p}: {_PROVIDER_ERRORS[p]}")
+    for p, msg in _PROVIDER_ERRORS.items():
+        if p not in {"planetary", "aws"}:
+            ordered.append(f"{p}: {msg}")
+    return " | ".join(ordered)
+
 
 @lru_cache(maxsize=2)
 def get_planetary_client():
@@ -86,6 +107,14 @@ LABELS = [
     'Very Good', 'Excellent', 'Dense', 'Very Dense', 'Extreme'
 ]
 EDGES = np.array([-0.2,0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.01], dtype="float32")
+# Per-index bin edges (12 values -> 11 bins including "clouds"/nodata bucket handling in caller).
+# CCC can exceed 1.0 in healthy crop canopies, so it needs wider edges than NDVI-like indices.
+INDEX_EDGES = {
+    "CCC": np.array([0.2, 0.5, 0.8, 1.0, 1.2, 1.5, 1.8, 2.2, 2.8, 3.5, 5.0, 8.0], dtype="float32"),
+}
+
+def get_index_edges(index_name: str) -> np.ndarray:
+    return INDEX_EDGES.get((index_name or "").upper(), EDGES)
 
 index_palettes_labels = {
     'NDVI': {
@@ -417,12 +446,42 @@ def read_scl_window(src, geom_sc, out_h, out_w, transform):
 
 # ---------- STAC helpers ----------
 def search_planetary(collections, intersects, dt, limit=50):
-    cat = get_planetary_client()
-    return list(cat.search(collections=collections, intersects=intersects, datetime=dt, limit=limit).items())
+    try:
+        cat = get_planetary_client()
+        items = list(cat.search(collections=collections, intersects=intersects, datetime=dt, limit=limit).items())
+        _clear_provider_error("planetary")
+        return items
+    except Exception as e:
+        _set_provider_error("planetary", e)
+        # Fail-soft so callers can fall back to AWS when Planetary is slow/unavailable.
+        try:
+            get_planetary_client.cache_clear()
+            cat = get_planetary_client()
+            items = list(cat.search(collections=collections, intersects=intersects, datetime=dt, limit=limit).items())
+            _clear_provider_error("planetary")
+            return items
+        except Exception as e2:
+            _set_provider_error("planetary", e2)
+            return []
 
 def search_aws(collections, intersects, dt, limit=50):
-    cat = get_aws_client()
-    return list(cat.search(collections=collections, intersects=intersects, datetime=dt, limit=limit).items())
+    try:
+        cat = get_aws_client()
+        items = list(cat.search(collections=collections, intersects=intersects, datetime=dt, limit=limit).items())
+        _clear_provider_error("aws")
+        return items
+    except Exception as e:
+        _set_provider_error("aws", e)
+        # Fail-soft for consistency with Planetary search helper.
+        try:
+            get_aws_client.cache_clear()
+            cat = get_aws_client()
+            items = list(cat.search(collections=collections, intersects=intersects, datetime=dt, limit=limit).items())
+            _clear_provider_error("aws")
+            return items
+        except Exception as e2:
+            _set_provider_error("aws", e2)
+            return []
 
 def items_for_date(aoi_geojson, iso_dt, collection, prefer_pc=True, limit=6):
     day = iso_dt[:10]
@@ -596,9 +655,13 @@ def _read_tile_into_stack(item, aoi_geojson, dst_transform, H, W, want_scl, requ
         return out
 
 # rendering helpers
-def ndvi_to_bins(arr: np.ndarray) -> np.ndarray:
-    arr = np.clip(arr, -1, 1)
-    bins = np.digitize(arr, EDGES).astype("uint8")
+def ndvi_to_bins(arr: np.ndarray, max_bin: int = 10, edges: Optional[np.ndarray] = None) -> np.ndarray:
+    edges_arr = np.asarray(edges if edges is not None else EDGES, dtype="float32")
+    arr = np.clip(arr, float(edges_arr[0]), float(edges_arr[-1]) - 1e-6)
+    bins = np.digitize(arr, edges_arr).astype("uint8")
+    # Bin 0 is reserved for nodata/cloud in rendering. Any finite value should be
+    # mapped to at least bin 1, then capped to the available data-bin range.
+    bins = np.clip(bins, 1, max(1, int(max_bin))).astype("uint8")
     return np.where(np.isfinite(arr), bins, 0)
 
 def compute_bounds_wgs84(transform: Affine, width: int, height: int, crs) -> List[float]:
@@ -619,12 +682,17 @@ def hex_to_rgba_tuple(hexcolor: str) -> Tuple[int,int,int,int]:
         return (r,g,b,255)
     return (0,0,0,255)
 
+def darken_rgba(rgba: Tuple[int, int, int, int], factor: float = 0.82) -> Tuple[int, int, int, int]:
+    r, g, b, a = rgba
+    f = float(np.clip(factor, 0.0, 1.0))
+    return (int(r * f), int(g * f), int(b * f), a)
+
 def render_spread_png_fast(bins_canvas: np.ndarray, NDVI_canvas: np.ndarray, res_m: float,
                            supersample: int, smooth: bool, gaussian_sigma: float,
                            out_w: int, out_h: int, palette: Optional[List[str]] = None,
                            labels: Optional[List[str]] = None, nodata_transparent: bool = True,
                            aoi_ll_geojson: Optional[dict] = None, transform: Optional[Affine] = None,
-                           crs = None) -> str:
+                           crs = None, max_bin: int = 10, edges: Optional[np.ndarray] = None) -> str:
     if palette is None:
         palette = PALETTE
     if labels is None:
@@ -667,7 +735,12 @@ def render_spread_png_fast(bins_canvas: np.ndarray, NDVI_canvas: np.ndarray, res
             num = gaussian_filter(vals, sigma=sigma)
             den = gaussian_filter(inside, sigma=sigma)
             NDVI_up = np.where(den > 1e-6, num / den, np.nan)
-        bins_up = np.digitize(np.clip(NDVI_up, EDGES[0], EDGES[-1] - 1e-6), EDGES).astype("uint8")
+        edges_arr = np.asarray(edges if edges is not None else EDGES, dtype="float32")
+        bins_up = np.digitize(
+            np.clip(NDVI_up, float(edges_arr[0]), float(edges_arr[-1]) - 1e-6),
+            edges_arr
+        ).astype("uint8")
+        bins_up = np.clip(bins_up, 1, max(1, int(max_bin))).astype("uint8")
         bins_up = np.where(np.isfinite(NDVI_up), bins_up, 0)
     else:
         bins_up = bins_canvas.astype("uint8")
@@ -677,6 +750,10 @@ def render_spread_png_fast(bins_canvas: np.ndarray, NDVI_canvas: np.ndarray, res
 
     Hs, Ws = bins_up.shape
     palette_rgba = [hex_to_rgba_tuple(c) for c in palette]
+    # Darken index classes slightly so map colors are less faint and easier to read.
+    # Keep the first palette entry unchanged (typically "Clouds"/NoData color).
+    if len(palette_rgba) > 1:
+        palette_rgba = [palette_rgba[0]] + [darken_rgba(c, factor=0.82) for c in palette_rgba[1:]]
     if len(palette_rgba) < 2:
         palette_rgba = [(0,0,0,0), (0,255,0,255)]
 

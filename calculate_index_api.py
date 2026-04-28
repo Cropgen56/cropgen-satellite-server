@@ -76,6 +76,16 @@ def calculate_index(req: CalculateRequest):
     try:
         item, has_scl, coll = utils.pick_best_item(geom, date_str, date_str, prefer_pc=prefer_pc, satellite=satellite)
         if not item:
+            provider_diag = utils.get_provider_error_summary()
+            if provider_diag:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "No suitable item found for date/AOI. "
+                        f"Provider diagnostics: {provider_diag}. "
+                        "This may indicate upstream timeout/unavailability."
+                    ),
+                )
             raise HTTPException(status_code=404, detail="No suitable item found for date/AOI")
 
         first_assets = item.assets or {}
@@ -220,11 +230,12 @@ def calculate_index(req: CalculateRequest):
             except Exception:
                 pass
 
-        if S_stack is not None:
+        if S_stack is not None and index_arr is not None:
             classes = [8, 9, 10, 11]
             index_arr[np.isin(S_stack, classes)] = np.nan
 
-        index_arr[~aoi_mask] = np.nan
+        if index_arr is not None:
+            index_arr[~aoi_mask] = np.nan
 
         # ---- TRUE_COLOR special rendering ----
         if index_name == "TRUE_COLOR":
@@ -251,16 +262,25 @@ def calculate_index(req: CalculateRequest):
                 Gf = np.where(np.isfinite(G), G, 0.0)
                 Bf = np.where(np.isfinite(B), B, 0.0)
 
-            def stretch_channel(ch):
-                vals = ch[valid_mask]
-                if vals.size == 0: return ch
-                lo = np.nanpercentile(vals, 2)
-                hi = np.nanpercentile(vals, 98)
-                if hi <= lo: return np.clip((ch - lo), 0.0, 1.0)
-                out = (ch - lo) / (hi - lo)
-                return np.clip(out, 0.0, 1.0)
+            # Use a single luminance-based stretch for all channels to preserve
+            # natural color balance. Independent per-channel stretch can produce
+            # magenta/green false-color artifacts on small AOIs.
+            lum = 0.2126 * Rf + 0.7152 * Gf + 0.0722 * Bf
+            lum_vals = lum[valid_mask]
+            if lum_vals.size == 0:
+                raise HTTPException(status_code=424, detail="No valid luminance pixels for TRUE_COLOR")
+            lo = np.nanpercentile(lum_vals, 2)
+            hi = np.nanpercentile(lum_vals, 98)
+            if hi <= lo:
+                lo, hi = 0.0, 0.3
 
-            Rn, Gn, Bn = map(stretch_channel, [Rf, Gf, Bf])
+            def stretch_common(ch):
+                out = (ch - lo) / (hi - lo)
+                out = np.clip(out, 0.0, 1.0)
+                # Mild gamma for more natural visual contrast.
+                return np.power(out, 1.0 / 1.15)
+
+            Rn, Gn, Bn = map(stretch_common, [Rf, Gf, Bf])
             rgb = np.stack([Rn, Gn, Bn], axis=-1)
             rgb_uint8 = (rgb * 255.0).astype("uint8")
 
@@ -291,14 +311,16 @@ def calculate_index(req: CalculateRequest):
         if validvals.size == 0:
             raise HTTPException(status_code=424, detail="Index has no valid pixels after masking")
 
-        bins_full = utils.ndvi_to_bins(index_arr)
-        NDVI_canvas = index_arr
-
         if index_name in utils.index_palettes_labels:
             palette = utils.index_palettes_labels[index_name]['palette']
             labels = utils.index_palettes_labels[index_name]['labels']
         else:
             palette, labels = utils.PALETTE_MAP.get(index_name, (utils.PALETTE, utils.LABELS))
+        max_data_bin = max(1, len(palette) - 1)
+        index_edges = utils.get_index_edges(index_name)
+
+        bins_full = utils.ndvi_to_bins(index_arr, max_bin=max_data_bin, edges=index_edges)
+        NDVI_canvas = index_arr
 
         # Pass AOI geometry, transform, and CRS for proper masking
         img_b64 = utils.render_spread_png_fast(
@@ -308,7 +330,9 @@ def calculate_index(req: CalculateRequest):
             nodata_transparent=True,
             aoi_ll_geojson=geom,
             transform=dst_transform,
-            crs=target_crs
+            crs=target_crs,
+            max_bin=max_data_bin,
+            edges=index_edges
         )
 
         legend = []
@@ -356,4 +380,20 @@ def calculate_index(req: CalculateRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raw_detail = str(e)
+        lower_detail = raw_detail.lower()
+        provider_diag = utils.get_provider_error_summary()
+        if "maximum allowed time" in lower_detail or "timeout" in lower_detail:
+            detail = (
+                "Upstream provider request timed out while computing this index."
+                + (f" Provider diagnostics: {provider_diag}." if provider_diag else "")
+                + " Try again, or use provider='aws' to bypass Planetary fallback path."
+            )
+            raise HTTPException(status_code=504, detail=detail)
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                raw_detail
+                + (f" | Provider diagnostics: {provider_diag}" if provider_diag else "")
+            ),
+        )
