@@ -5,8 +5,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from availability_dates_api import router as availability_router
 from calculate_index_api import router as calculate_router
+from npk_availability_api import router as npk_router
 from timeseries_vegetation_api import router as veg_router
 from timeseries_water_api import router as water_router
+from crop_health_api import router as crop_health_router
 from auth import get_expected_api_key, validate_api_key
 
 load_dotenv(override=True)  # override=True ensures .env always wins over shell/conda env vars
@@ -80,6 +82,20 @@ app.include_router(
     water_router,
     prefix="/v4/api/timeseries/water",
     tags=["Water Timeseries"],
+    dependencies=[Depends(validate_api_key)],
+)
+
+app.include_router(
+    npk_router,
+    prefix="/v4/api/npk",
+    tags=["NPK Availability"],
+    dependencies=[Depends(validate_api_key)],
+)
+
+app.include_router(
+    crop_health_router,
+    prefix="/v4/api/crop-health",
+    tags=["Crop Health"],
     dependencies=[Depends(validate_api_key)],
 )
 
