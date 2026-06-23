@@ -81,3 +81,67 @@ class CropHealthResponse(BaseModel):
     stress: str
     stage: str
     cloud_coverage: Optional[float] = None
+
+
+class SocAnalysisRequest(BaseModel):
+    geometry: Dict[str, Any]
+    start_date: str
+    end_date: str
+    provider: Optional[str] = "both"
+    satellite: Optional[str] = "s2"
+
+
+class SocClassStat(BaseModel):
+    pixels: int
+    ha: float
+    acres: float
+    pct_area: float
+
+
+class SocStats(BaseModel):
+    mean_pct: float
+    min_pct: float
+    max_pct: float
+    std_pct: float
+    total_area_ha: float
+    total_area_acres: float
+    classes: Dict[str, SocClassStat]
+
+
+class SocAnalysisResponse(BaseModel):
+    date: str
+    cloud_cover: Optional[float] = None
+    image_base64: str
+    soc_stats: SocStats
+    metadata: Dict[str, Any]
+
+
+class VraZoneRate(BaseModel):
+    pixel_count: int
+    area_ha: float
+    area_acres: float
+    nutrient_dose_kg_ha: float
+    product: str
+    product_dose_kg_ha: float
+    total_product_kg: float
+
+
+class VraAnalysisRequest(BaseModel):
+    geometry: Dict[str, Any]
+    start_date: str
+    end_date: str
+    crop: str = "wheat"
+    provider: Optional[str] = "both"
+    satellite: Optional[str] = "s2"
+    include_images: bool = True
+
+
+class VraAnalysisResponse(BaseModel):
+    date: str
+    crop: str
+    cloud_cover: Optional[float] = None
+    vra_rates: Dict[str, Dict[str, VraZoneRate]]
+    soc_stats: SocStats
+    images: Optional[Dict[str, str]] = None
+    text_report: Optional[str] = None
+    metadata: Dict[str, Any]

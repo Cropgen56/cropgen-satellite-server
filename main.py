@@ -9,6 +9,8 @@ from npk_availability_api import router as npk_router
 from timeseries_vegetation_api import router as veg_router
 from timeseries_water_api import router as water_router
 from crop_health_api import router as crop_health_router
+from soc_api import router as soc_router
+from vra_api import router as vra_router
 from auth import get_expected_api_key, validate_api_key
 
 load_dotenv(override=True)  # override=True ensures .env always wins over shell/conda env vars
@@ -96,6 +98,20 @@ app.include_router(
     crop_health_router,
     prefix="/v4/api/crop-health",
     tags=["Crop Health"],
+    dependencies=[Depends(validate_api_key)],
+)
+
+app.include_router(
+    soc_router,
+    prefix="/v4/api/soc",
+    tags=["SOC"],
+    dependencies=[Depends(validate_api_key)],
+)
+
+app.include_router(
+    vra_router,
+    prefix="/v4/api/vra",
+    tags=["VRA"],
     dependencies=[Depends(validate_api_key)],
 )
 
