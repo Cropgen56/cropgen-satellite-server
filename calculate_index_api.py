@@ -3,9 +3,11 @@ from models import CalculateRequest, CalculateResponse
 import utils
 import numpy as np
 import time
+import json
 from datetime import datetime, timedelta
 import io
 import base64
+from typing import Any, Dict, Optional
 
 # rasterio + helpers (needed here because we call rasterio.open, Resampling, etc.)
 import rasterio
@@ -20,6 +22,43 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import Image
 
 router = APIRouter()
+
+RESPONSE_CACHE_TTL_SECONDS = 10 * 60
+_RESPONSE_CACHE: Dict[str, tuple[float, Dict[str, Any]]] = {}
+
+
+def _request_cache_key(req: CalculateRequest, index_name: str) -> str:
+    return json.dumps(
+        {
+            "geometry": req.geometry,
+            "date": req.date,
+            "index_name": index_name,
+            "provider": (req.provider or "both").lower(),
+            "satellite": (req.satellite or "s2").lower(),
+            "width": int(req.width or 800),
+            "height": int(req.height or 800),
+            "supersample": int(req.supersample or 4),
+            "smooth": bool(req.smooth if req.smooth is not None else True),
+            "gaussian_sigma": float(req.gaussian_sigma or 3.0),
+        },
+        sort_keys=True,
+    )
+
+
+def _get_cached_response(cache_key: str) -> Optional[Dict[str, Any]]:
+    cached = _RESPONSE_CACHE.get(cache_key)
+    if not cached:
+        return None
+    timestamp, value = cached
+    if time.time() - timestamp > RESPONSE_CACHE_TTL_SECONDS:
+        _RESPONSE_CACHE.pop(cache_key, None)
+        return None
+    return value
+
+
+def _set_cached_response(cache_key: str, value: Dict[str, Any]) -> Dict[str, Any]:
+    _RESPONSE_CACHE[cache_key] = (time.time(), value)
+    return value
 
 @router.post("/index", response_model=CalculateResponse)
 def calculate_index(req: CalculateRequest):
@@ -73,6 +112,11 @@ def calculate_index(req: CalculateRequest):
         raise HTTPException(status_code=400, detail=f"Unsupported index: {index_name}")
     required_bands = index_band_map[index_name]
 
+    cache_key = _request_cache_key(req, index_name)
+    cached = _get_cached_response(cache_key)
+    if cached is not None:
+        return cached
+
     try:
         item, has_scl, coll = utils.pick_best_item(geom, date_str, date_str, prefer_pc=prefer_pc, satellite=satellite)
         if not item:
@@ -89,20 +133,20 @@ def calculate_index(req: CalculateRequest):
             raise HTTPException(status_code=404, detail="No suitable item found for date/AOI")
 
         first_assets = item.assets or {}
-        # pick a reasonable asset href
-        first_candidate = utils.prefer_http_from_asset(first_assets.get("red") or first_assets.get("B04"))
-        if not first_candidate:
-            # try any asset
-            for a in first_assets.values():
-                h = utils.prefer_http_from_asset(a)
-                if h:
-                    first_candidate = h
-                    break
-        first_red = utils.sign_href_if_pc(first_candidate) if first_candidate else None
-        if not first_red:
-            raise HTTPException(status_code=500, detail="Could not determine reference band URL")
-        with rasterio.open(first_red) as fr:
-            target_crs = fr.crs
+        target_crs = utils.get_item_crs(item)
+        if target_crs is None:
+            first_candidate = utils.prefer_http_from_asset(first_assets.get("red") or first_assets.get("B04"))
+            if not first_candidate:
+                for a in first_assets.values():
+                    h = utils.prefer_http_from_asset(a)
+                    if h:
+                        first_candidate = h
+                        break
+            first_red = utils.sign_href_if_pc(first_candidate) if first_candidate else None
+            if not first_red:
+                raise HTTPException(status_code=500, detail="Could not determine reference band URL")
+            with rasterio.open(first_red) as fr:
+                target_crs = fr.crs
 
         aoi_sc, dst_transform, H, W, res_m = utils.build_adaptive_grid(target_crs, geom, native_res_m=10.0)
 
@@ -176,26 +220,32 @@ def calculate_index(req: CalculateRequest):
             e = (datetime.strptime(date_str, fmt) + timedelta(days=14)).strftime(fmt)
             items_extra = []
             for provider_name in search_order:
-                if provider_name == "planetary":
-                    items_extra = utils.search_planetary([coll_name], geom, f"{s}/{e}", limit=12)
-                else:
-                    items_extra = utils.search_aws([coll_name], geom, f"{s}/{e}", limit=12)
+                items_extra = utils.search_stac_items(
+                    [coll_name], geom, f"{s}/{e}", limit=12, search_order=[provider_name]
+                )
                 if items_extra:
                     break
             items_extra = [it for it in items_extra if getattr(it, "id", None) != getattr(item, "id", None)]
             try:
                 median_bands = {}
-                for band in required_bands:
-                    median_bands[band] = utils.temporal_fill_median(
-                        band,
-                        items_extra,
-                        geom,
-                        dst_transform,
-                        H,
-                        W,
-                        want_scl=False,
-                        max_items=6,
-                    )
+                with ThreadPoolExecutor(max_workers=min(utils.THREADS, len(required_bands))) as fill_ex:
+                    fill_futs = {
+                        fill_ex.submit(
+                            utils.temporal_fill_median,
+                            band,
+                            items_extra,
+                            geom,
+                            dst_transform,
+                            H,
+                            W,
+                            False,
+                            6,
+                        ): band
+                        for band in required_bands
+                    }
+                    for fut in as_completed(fill_futs):
+                        band = fill_futs[fut]
+                        median_bands[band] = fut.result()
 
                 if all(median_bands[band] is not None for band in required_bands):
                     if index_name == "TRUE_COLOR":
@@ -298,13 +348,13 @@ def calculate_index(req: CalculateRequest):
 
             bounds = utils.compute_bounds_wgs84(dst_transform, W, H, target_crs)
             merged_legend = [{"color": "#000000", "label": "True Color", "hectares": 0.0, "percent": 0.0}]
-            return {
+            return _set_cached_response(cache_key, {
                 "date": date_str,
                 "index_name": index_name,
                 "image_base64": img_b64,
                 "bounds": bounds,
                 "legend": merged_legend
-            }
+            })
         # ---- END TRUE_COLOR ----
 
         validvals = index_arr[np.isfinite(index_arr) & aoi_mask]
@@ -369,13 +419,13 @@ def calculate_index(req: CalculateRequest):
                 "percent": am.get("percent", 0.0)
             })
 
-        return {
+        return _set_cached_response(cache_key, {
             "date": date_str,
             "index_name": index_name,
             "image_base64": img_b64,
             "bounds": bounds,
             "legend": merged_legend
-        }
+        })
 
     except HTTPException:
         raise

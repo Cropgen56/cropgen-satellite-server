@@ -1,5 +1,6 @@
 import os
 import io
+import json
 import base64
 import math
 import time
@@ -18,6 +19,7 @@ from rasterio.windows import transform as win_transform, bounds as win_bounds
 from rasterio.enums import Resampling
 from rasterio.features import geometry_mask
 from rasterio.warp import reproject
+from rasterio.crs import CRS
 from affine import Affine
 from shapely.geometry import shape, mapping
 from shapely.ops import transform as shp_transform
@@ -37,15 +39,22 @@ os.environ.setdefault("GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR")
 os.environ.setdefault("CPL_VSIL_CURL_ALLOWED_EXTENSIONS", ".tif,.tiff,.jp2,.JP2,.TIF,.TIFF,.JP2")
 os.environ.setdefault("AWS_NO_SIGN_REQUEST", "YES")
 os.environ.setdefault("GDAL_HTTP_MULTIRANGE", "YES")
-os.environ.setdefault("GDAL_CACHEMAX", "512")
+os.environ.setdefault("GDAL_HTTP_MERGE_CONSECUTIVE_RANGES", "YES")
+os.environ.setdefault("VSI_CACHE", "TRUE")
+os.environ.setdefault("VSI_CACHE_SIZE", "25000000")
+os.environ.setdefault("GDAL_CACHEMAX", "1024")
 
 EARTH_SEARCH_AWS = "https://earth-search.aws.element84.com/v1"
 PLANETARY_STAC = "https://planetarycomputer.microsoft.com/api/stac/v1"
 SENTINEL1_COLLECTION = "sentinel-1-grd"
 SENTINEL2_COLLECTIONS = ["sentinel-2-l2a", "sentinel-2-l1c"]
 
-# default threads (reduce if network-bound)
-THREADS = min(4, (os.cpu_count() or 4))
+# I/O-bound COG reads benefit from more concurrent workers than CPU count.
+THREADS = min(16, max(8, (os.cpu_count() or 4) * 2))
+
+# Short-lived caches for repeated reads within a warm process.
+_KEEP_PCT_CACHE: Dict[str, Tuple[float, float, bool]] = {}
+_KEEP_PCT_CACHE_TTL = 30 * 60
 
 # Best-effort diagnostics to explain provider fallback failures.
 _PROVIDER_ERRORS: Dict[str, str] = {}
@@ -95,6 +104,130 @@ def get_provider_search_order(provider: Optional[str], prefer_pc_default: bool =
     if prefer_pc_default:
         return ["planetary", "aws"]
     return ["aws", "planetary"]
+
+
+STAC_METADATA_FIELDS = {
+    "include": [
+        "id",
+        "properties.datetime",
+        "properties.acquired",
+        "properties.eo:cloud_cover",
+        "properties.cloud_cover",
+    ],
+    "exclude": ["assets", "links"],
+}
+
+
+def search_stac_items(
+    collections: List[str],
+    intersects: Dict[str, Any],
+    dt: str,
+    limit: int = 50,
+    search_order: Optional[List[str]] = None,
+    metadata_only: bool = False,
+) -> List[Any]:
+    """Search STAC providers in parallel while preserving provider preference order."""
+    order = search_order or ["planetary", "aws"]
+    unique_order = list(dict.fromkeys(order))
+    if len(unique_order) == 1:
+        provider = unique_order[0]
+        if provider == "planetary":
+            return search_planetary(collections, intersects, dt, limit=limit, metadata_only=metadata_only)
+        return search_aws(collections, intersects, dt, limit=limit, metadata_only=metadata_only)
+
+    futures: Dict[str, Any] = {}
+    with ThreadPoolExecutor(max_workers=len(unique_order)) as ex:
+        for provider in unique_order:
+            if provider == "planetary":
+                futures[provider] = ex.submit(
+                    search_planetary, collections, intersects, dt, limit, metadata_only
+                )
+            elif provider == "aws":
+                futures[provider] = ex.submit(
+                    search_aws, collections, intersects, dt, limit, metadata_only
+                )
+        results = {provider: futures[provider].result() for provider in futures}
+
+    for provider in unique_order:
+        items = results.get(provider) or []
+        if items:
+            return items
+    return []
+
+
+def get_item_crs(item) -> Optional[CRS]:
+    """Resolve scene CRS from STAC metadata to avoid an extra COG open."""
+    props = getattr(item, "properties", {}) or {}
+    epsg = props.get("proj:epsg")
+    if epsg is not None:
+        try:
+            return CRS.from_epsg(int(epsg))
+        except Exception:
+            pass
+    code = props.get("proj:code")
+    if code:
+        try:
+            return CRS.from_user_input(code)
+        except Exception:
+            pass
+    return None
+
+
+def sign_band_assets(item, band_keys: List[str]) -> Dict[str, Optional[str]]:
+    """Sign only the band assets needed for a request."""
+    assets = getattr(item, "assets", {}) or {}
+    signed: Dict[str, Optional[str]] = {}
+    for band in band_keys:
+        asset = assets.get(band) or assets.get(band.upper()) or assets.get(band.lower())
+        url = prefer_http_from_asset(asset) if asset else None
+        signed[band] = sign_href_if_pc(url) if url else None
+    return signed
+
+
+@lru_cache(maxsize=512)
+def _aoi_to_scene_cached(geom_json: str, crs_str: str):
+    return aoi_to_scene(json.loads(geom_json), crs_str)
+
+
+def aoi_to_scene_cached(aoi_ll_geojson, crs_str: str):
+    return _aoi_to_scene_cached(json.dumps(aoi_ll_geojson, sort_keys=True), crs_str)
+
+
+def read_bands_window_parallel(
+    band_urls: Dict[str, Optional[str]],
+    geom,
+    out_h: int,
+    out_w: int,
+    resampling=Resampling.bilinear,
+    scale_reflectance: bool = True,
+) -> Dict[str, Optional[np.ndarray]]:
+    """Read multiple band windows concurrently (same output as sequential reads)."""
+    if not band_urls:
+        return {}
+
+    def _read_one(entry: Tuple[str, Optional[str]]):
+        band_key, url = entry
+        if not url:
+            return band_key, None
+        try:
+            with rasterio.Env():
+                with rasterio.open(url) as ds:
+                    aoi_sc = aoi_to_scene_cached(geom, ds.crs.to_string())
+                    arr = read_band_window(
+                        ds, aoi_sc, out_h, out_w, ds.transform, resampling
+                    )
+                    if scale_reflectance and np.isfinite(arr).any() and np.nanmax(arr) > 1.5:
+                        arr = arr * (1 / 10000.0)
+                    return band_key, arr
+        except Exception:
+            return band_key, None
+
+    workers = min(THREADS, max(1, len(band_urls)))
+    results: Dict[str, Optional[np.ndarray]] = {k: None for k in band_urls}
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for band_key, arr in ex.map(_read_one, band_urls.items()):
+            results[band_key] = arr
+    return results
 
 # ---------- Palettes & labels ----------
 # Default palette and labels (using NDVI as fallback)
@@ -445,10 +578,23 @@ def read_scl_window(src, geom_sc, out_h, out_w, transform):
     return dst
 
 # ---------- STAC helpers ----------
-def search_planetary(collections, intersects, dt, limit=50):
+def _stac_search_kwargs(collections, intersects, dt, limit, metadata_only: bool):
+    kwargs = {
+        "collections": collections,
+        "intersects": intersects,
+        "datetime": dt,
+        "limit": limit,
+    }
+    if metadata_only:
+        kwargs["fields"] = STAC_METADATA_FIELDS
+    return kwargs
+
+
+def search_planetary(collections, intersects, dt, limit=50, metadata_only: bool = False):
+    search_kwargs = _stac_search_kwargs(collections, intersects, dt, limit, metadata_only)
     try:
         cat = get_planetary_client()
-        items = list(cat.search(collections=collections, intersects=intersects, datetime=dt, limit=limit).items())
+        items = list(cat.search(**search_kwargs).items())
         _clear_provider_error("planetary")
         return items
     except Exception as e:
@@ -457,17 +603,18 @@ def search_planetary(collections, intersects, dt, limit=50):
         try:
             get_planetary_client.cache_clear()
             cat = get_planetary_client()
-            items = list(cat.search(collections=collections, intersects=intersects, datetime=dt, limit=limit).items())
+            items = list(cat.search(**search_kwargs).items())
             _clear_provider_error("planetary")
             return items
         except Exception as e2:
             _set_provider_error("planetary", e2)
             return []
 
-def search_aws(collections, intersects, dt, limit=50):
+def search_aws(collections, intersects, dt, limit=50, metadata_only: bool = False):
+    search_kwargs = _stac_search_kwargs(collections, intersects, dt, limit, metadata_only)
     try:
         cat = get_aws_client()
-        items = list(cat.search(collections=collections, intersects=intersects, datetime=dt, limit=limit).items())
+        items = list(cat.search(**search_kwargs).items())
         _clear_provider_error("aws")
         return items
     except Exception as e:
@@ -476,7 +623,7 @@ def search_aws(collections, intersects, dt, limit=50):
         try:
             get_aws_client.cache_clear()
             cat = get_aws_client()
-            items = list(cat.search(collections=collections, intersects=intersects, datetime=dt, limit=limit).items())
+            items = list(cat.search(**search_kwargs).items())
             _clear_provider_error("aws")
             return items
         except Exception as e2:
@@ -486,19 +633,19 @@ def search_aws(collections, intersects, dt, limit=50):
 def items_for_date(aoi_geojson, iso_dt, collection, prefer_pc=True, limit=6):
     day = iso_dt[:10]
     dt = f"{day}/{day}"
-    if prefer_pc:
-        items = search_planetary([collection], aoi_geojson, dt, limit=limit)
-        if items:
-            return items
-        return search_aws([collection], aoi_geojson, dt, limit=limit)
-    else:
-        items = search_aws([collection], aoi_geojson, dt, limit=limit)
-        if items:
-            return items
-        return search_planetary([collection], aoi_geojson, dt, limit=limit)
+    order = ["planetary", "aws"] if prefer_pc else ["aws", "planetary"]
+    return search_stac_items([collection], aoi_geojson, dt, limit=limit, search_order=order)
 
 # quick keep pct
 def quick_keep_pct(item, aoi_geojson):
+    item_id = getattr(item, "id", None) or ""
+    geom_key = json.dumps(aoi_geojson, sort_keys=True)
+    cache_key = f"{item_id}|{hash(geom_key)}"
+    now = time.time()
+    cached = _KEEP_PCT_CACHE.get(cache_key)
+    if cached and now - cached[0] < _KEEP_PCT_CACHE_TTL:
+        return cached[1], cached[2]
+
     assets = item.assets
     red = prefer_http_from_asset(assets.get("red") or assets.get("B04"))
     nir = prefer_http_from_asset(assets.get("nir") or assets.get("B08"))
@@ -535,34 +682,30 @@ def quick_keep_pct(item, aoi_geojson):
                         nd[np.isin(S, classes)] = np.nan
                 kept = np.count_nonzero(np.isfinite(nd) & mask)
                 total = np.count_nonzero(mask)
-                return (kept / max(total, 1)) * 100.0, bool(sds)
+                result = (kept / max(total, 1)) * 100.0, bool(sds)
+                _KEEP_PCT_CACHE[cache_key] = (now, result[0], result[1])
+                return result
     except Exception:
         return 0.0, False
 
 # pick best item
 def pick_best_item(aoi_geojson, start, end, prefer_pc=True, satellite="s2"):
     collections_try = get_collections_for_satellite(satellite)
-    items = []
-    if prefer_pc:
-        items = search_planetary(collections_try, aoi_geojson, f"{start}/{end}", limit=12)
-        if not items:
-            items = search_aws(collections_try, aoi_geojson, f"{start}/{end}", limit=12)
-    else:
-        items = search_aws(collections_try, aoi_geojson, f"{start}/{end}", limit=12)
-        if not items:
-            items = search_planetary(collections_try, aoi_geojson, f"{start}/{end}", limit=12)
+    search_order = ["planetary", "aws"] if prefer_pc else ["aws", "planetary"]
+    dt = f"{start}/{end}"
+    items = search_stac_items(collections_try, aoi_geojson, dt, limit=12, search_order=search_order)
     if not items:
         fmt = "%Y-%m-%d"
         s = datetime.strptime(start, fmt) - timedelta(days=14)
         e = datetime.strptime(end, fmt) + timedelta(days=14)
-        items = search_planetary(collections_try, aoi_geojson, f"{s.strftime(fmt)}/{e.strftime(fmt)}", limit=24)
-        if not items:
-            items = search_aws(collections_try, aoi_geojson, f"{s.strftime(fmt)}/{e.strftime(fmt)}", limit=24)
+        expanded_dt = f"{s.strftime(fmt)}/{e.strftime(fmt)}"
+        items = search_stac_items(collections_try, aoi_geojson, expanded_dt, limit=24, search_order=search_order)
     if not items:
         return None, False, None
 
     scored = []
-    with ThreadPoolExecutor(max_workers=min(6, len(items))) as ex:
+    workers = min(THREADS, max(1, len(items)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {ex.submit(quick_keep_pct, it, aoi_geojson): it for it in items}
         for f in as_completed(futs):
             try:
@@ -596,16 +739,14 @@ def _read_tile_into_stack(item, aoi_geojson, dst_transform, H, W, want_scl, requ
     out = {"used": False, "bands": {}, "S": None, "id": getattr(item, "id", None)}
     assets = item.assets or {}
     required_bands = list(dict.fromkeys(required_bands or ["B04", "B08"]))
-    # pick best asset href heuristically
+
     def first_asset_href(assets_dict):
-        # try some known names then fall back to first valid href
-        for k in ("red","B04","B04.jp2","B04.tif","B04.TIF"):
+        for k in ("red", "B04", "B04.jp2", "B04.tif", "B04.TIF"):
             a = assets_dict.get(k)
             if a:
                 h = prefer_http_from_asset(a)
                 if h:
                     return h
-        # fallback any asset with href
         for a in assets_dict.values():
             h = prefer_http_from_asset(a)
             if h:
@@ -617,37 +758,53 @@ def _read_tile_into_stack(item, aoi_geojson, dst_transform, H, W, want_scl, requ
     )
     if not primary_asset:
         return out
+
     scl_ref = assets.get("scl") or assets.get("SCL")
     scl_url = prefer_http_from_asset(scl_ref) if (want_scl and scl_ref) else None
     scl_url = sign_href_if_pc(scl_url) if scl_url else None
+
+    band_urls: Dict[str, Optional[str]] = {}
+    for bkey in required_bands:
+        a = assets.get(bkey) or assets.get(bkey.lower())
+        url = prefer_http_from_asset(a) if a else None
+        band_urls[bkey] = sign_href_if_pc(url) if url else None
+
     try:
-        with rasterio.open(sign_href_if_pc(primary_asset)) as ref_ds, \
-             (rasterio.open(scl_url) if scl_url else nullcontext()) as scl:
-            crs = ref_ds.crs
-            aoi_sc = aoi_to_scene(aoi_geojson, crs.to_string())
+        item_crs = get_item_crs(item)
+        with rasterio.Env():
+            if item_crs is None:
+                with rasterio.open(sign_href_if_pc(primary_asset)) as ref_ds:
+                    crs = ref_ds.crs
+                    aoi_sc = aoi_to_scene_cached(aoi_geojson, crs.to_string())
+            else:
+                aoi_sc = aoi_to_scene_cached(aoi_geojson, item_crs.to_string())
+
             S = None
-            if scl:
-                S = read_scl_window(scl, aoi_sc, H, W, dst_transform)
+            if scl_url:
+                with rasterio.open(scl_url) as scl:
+                    S = read_scl_window(scl, aoi_sc, H, W, dst_transform)
             out["S"] = S
 
-            loaded_required = 0
-            for bkey in required_bands:
-                a = assets.get(bkey) or assets.get(bkey.lower())
-                if not a:
-                    continue
-                url = prefer_http_from_asset(a)
+            def _read_band(entry: Tuple[str, Optional[str]]):
+                bkey, url = entry
                 if not url:
-                    continue
-                url = sign_href_if_pc(url)
+                    return bkey, None
                 try:
                     with rasterio.open(url) as ds:
                         arr = read_band_window(ds, aoi_sc, H, W, dst_transform, Resampling.bilinear)
                         if np.isfinite(arr).any() and np.nanmax(arr) > 1.5:
                             arr *= 1 / 10000.0
-                        out["bands"][bkey] = arr
-                        loaded_required += 1
+                        return bkey, arr
                 except Exception:
-                    out["bands"][bkey] = None
+                    return bkey, None
+
+            workers = min(THREADS, max(1, len(band_urls)))
+            loaded_required = 0
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                for bkey, arr in ex.map(_read_band, band_urls.items()):
+                    out["bands"][bkey] = arr
+                    if arr is not None:
+                        loaded_required += 1
 
             out["used"] = loaded_required > 0
             return out
@@ -792,24 +949,38 @@ def render_spread_png_fast(bins_canvas: np.ndarray, NDVI_canvas: np.ndarray, res
 
 def temporal_fill_median(band_key: str, items: List[Any], aoi_geojson, dst_transform, H, W, want_scl=False, max_items=6):
     stacks = []
-    used = 0
-    for it in items[:max_items]:
+
+    def _read_item(it):
         assets = it.assets or {}
         a = assets.get(band_key) or assets.get(band_key.lower())
         url = prefer_http_from_asset(a) if a else None
         if not url:
-            continue
+            return None
         url = sign_href_if_pc(url)
         try:
-            with rasterio.open(url) as ds:
-                arr = read_band_window(ds, aoi_to_scene(aoi_geojson, ds.crs.to_string()), H, W, dst_transform, Resampling.bilinear)
-                if np.nanmax(arr) > 1.5:
-                    arr *= 1/10000.0
-                stacks.append(np.where(np.isfinite(arr), arr, np.nan))
-                used += 1
+            with rasterio.Env():
+                with rasterio.open(url) as ds:
+                    arr = read_band_window(
+                        ds,
+                        aoi_to_scene_cached(aoi_geojson, ds.crs.to_string()),
+                        H,
+                        W,
+                        dst_transform,
+                        Resampling.bilinear,
+                    )
+                    if np.nanmax(arr) > 1.5:
+                        arr *= 1 / 10000.0
+                    return np.where(np.isfinite(arr), arr, np.nan)
         except Exception:
-            continue
-    if used == 0:
+            return None
+
+    workers = min(THREADS, max(1, min(max_items, len(items))))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for arr in ex.map(_read_item, items[:max_items]):
+            if arr is not None:
+                stacks.append(arr)
+
+    if not stacks:
         return None
     stacked = np.stack(stacks, axis=0)
     median = np.nanmedian(stacked, axis=0)
