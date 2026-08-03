@@ -106,14 +106,10 @@ def get_provider_search_order(provider: Optional[str], prefer_pc_default: bool =
     return ["aws", "planetary"]
 
 
+# Exclude heavy fields only. Using a narrow `include` list drops required STAC
+# keys (e.g. type/geometry) and breaks Planetary Computer Sentinel-1 parsing:
+# "'type' attribute is not set".
 STAC_METADATA_FIELDS = {
-    "include": [
-        "id",
-        "properties.datetime",
-        "properties.acquired",
-        "properties.eo:cloud_cover",
-        "properties.cloud_cover",
-    ],
     "exclude": ["assets", "links"],
 }
 

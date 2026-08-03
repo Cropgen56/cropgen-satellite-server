@@ -93,7 +93,9 @@ def availability(req: AvailabilityRequest):
         )
 
         if not all_items:
-            return _set_cached_response(cache_key, {"items": []})
+            # Do not cache empty results: transient STAC/provider failures would
+            # otherwise pin {"items": []} for RESPONSE_CACHE_TTL_SECONDS.
+            return {"items": []}
 
         out_items = _aggregate_availability_items(all_items)
         return _set_cached_response(cache_key, {"items": out_items})
