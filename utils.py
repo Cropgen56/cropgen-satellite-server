@@ -46,8 +46,44 @@ os.environ.setdefault("GDAL_CACHEMAX", "1024")
 
 EARTH_SEARCH_AWS = "https://earth-search.aws.element84.com/v1"
 PLANETARY_STAC = "https://planetarycomputer.microsoft.com/api/stac/v1"
-SENTINEL1_COLLECTION = "sentinel-1-grd"
+SENTINEL1_COLLECTION = "sentinel-1-rtc"  # terrain-corrected, CRS-ready (GRD is GCP-only)
 SENTINEL2_COLLECTIONS = ["sentinel-2-l2a", "sentinel-2-l1c"]
+
+# Sentinel-1 radar indices (cloud-penetrating).
+# Canonical names; aliases normalized in normalize_s1_index().
+S1_INDICES = {
+    "VV", "VH",           # backscatter dB — soil moisture / crop biomass
+    "VV_VH", "VH_VV",     # dual-pol ratios — structure / growth
+    "RVI",                # vegetation vigor
+    "SDWI",               # waterlogging / flood proxy
+    "SIGMA0", "SIGMA0_VV", "SIGMA0_VH",  # σ⁰ backscatter (dB)
+    "GAMMA0", "GAMMA0_VV", "GAMMA0_VH",  # γ⁰ terrain-corrected (dB); RTC native
+    "VV_DB", "VH_DB",     # legacy aliases → VV / VH
+}
+S1_INDEX_ALIASES = {
+    "VV_DB": "VV",
+    "VH_DB": "VH",
+    "SIGMA0": "SIGMA0_VV",
+    "GAMMA0": "GAMMA0_VV",
+}
+S1_BANDS = {"VV", "VH"}
+OPTICAL_INDICES = {
+    "NDVI", "EVI", "EVI2", "SAVI", "MSAVI", "NDMI", "NDWI", "SMI",
+    "CCC", "NITROGEN", "SOC", "NDRE", "RECI", "TRUE_COLOR",
+}
+# STAC asset name aliases for required band keys.
+BAND_ASSET_ALIASES = {
+    "VV": ("vv", "VV"),
+    "VH": ("vh", "VH"),
+    "B02": ("B02", "blue", "B02.jp2"),
+    "B03": ("B03", "green", "B03.jp2"),
+    "B04": ("B04", "red", "B04.jp2"),
+    "B05": ("B05", "rededge1", "B05.jp2"),
+    "B08": ("B08", "nir", "B08.jp2"),
+    "B8A": ("B8A", "nir08", "B8A.jp2"),
+    "B11": ("B11", "swir16", "B11.jp2"),
+    "B12": ("B12", "swir22", "B12.jp2"),
+}
 
 # I/O-bound COG reads benefit from more concurrent workers than CPU count.
 THREADS = min(16, max(8, (os.cpu_count() or 4) * 2))
@@ -174,7 +210,7 @@ def sign_band_assets(item, band_keys: List[str]) -> Dict[str, Optional[str]]:
     assets = getattr(item, "assets", {}) or {}
     signed: Dict[str, Optional[str]] = {}
     for band in band_keys:
-        asset = assets.get(band) or assets.get(band.upper()) or assets.get(band.lower())
+        asset = resolve_asset(assets, band)
         url = prefer_http_from_asset(asset) if asset else None
         signed[band] = sign_href_if_pc(url) if url else None
     return signed
@@ -240,10 +276,24 @@ EDGES = np.array([-0.2,0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.01], dtype="float
 # CCC can exceed 1.0 in healthy crop canopies, so it needs wider edges than NDVI-like indices.
 INDEX_EDGES = {
     "CCC": np.array([0.2, 0.5, 0.8, 1.0, 1.2, 1.5, 1.8, 2.2, 2.8, 3.5, 5.0, 8.0], dtype="float32"),
+    "RVI": np.array([0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.01], dtype="float32"),
+    "VH_VV": np.array([0.0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.65, 0.8, 1.01], dtype="float32"),
+    "VV_VH": np.array([0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 7.0, 10.0, 15.0, 25.0], dtype="float32"),
+    # VV / VH / σ⁰ / γ⁰ in dB
+    "VV": np.array([-25.0, -22.0, -20.0, -18.0, -16.0, -14.0, -12.0, -10.0, -8.0, -6.0, -3.0, 1.0], dtype="float32"),
+    "VH": np.array([-30.0, -27.0, -24.0, -22.0, -20.0, -18.0, -16.0, -14.0, -12.0, -10.0, -7.0, 1.0], dtype="float32"),
+    "SIGMA0_VV": np.array([-25.0, -22.0, -20.0, -18.0, -16.0, -14.0, -12.0, -10.0, -8.0, -6.0, -3.0, 1.0], dtype="float32"),
+    "SIGMA0_VH": np.array([-30.0, -27.0, -24.0, -22.0, -20.0, -18.0, -16.0, -14.0, -12.0, -10.0, -7.0, 1.0], dtype="float32"),
+    "GAMMA0_VV": np.array([-25.0, -22.0, -20.0, -18.0, -16.0, -14.0, -12.0, -10.0, -8.0, -6.0, -3.0, 1.0], dtype="float32"),
+    "GAMMA0_VH": np.array([-30.0, -27.0, -24.0, -22.0, -20.0, -18.0, -16.0, -14.0, -12.0, -10.0, -7.0, 1.0], dtype="float32"),
+    # SDWI = ln(10*VV*VH); lower → more waterlogged / flooded
+    "SDWI": np.array([-12.0, -10.0, -8.0, -6.5, -5.0, -4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 3.0], dtype="float32"),
 }
 
 def get_index_edges(index_name: str) -> np.ndarray:
-    return INDEX_EDGES.get((index_name or "").upper(), EDGES)
+    name = (index_name or "").upper().replace("/", "_").replace(" ", "_")
+    name = S1_INDEX_ALIASES.get(name, name)
+    return INDEX_EDGES.get(name, EDGES)
 
 index_palettes_labels = {
     'NDVI': {
@@ -394,7 +444,108 @@ index_palettes_labels = {
             'Clouds', 'Very Low', 'Low', 'Fair', 'Moderate',
             'Good', 'Very Good', 'Excellent', 'Wet', 'Very Wet', 'Flooded'
         ]
-    }
+    },
+    # Sentinel-1 radar indices (bin 0 = No Data; radar sees through clouds)
+    'RVI': {
+        'palette': [
+            '#ffffff', '#d73027', '#f46d43', '#fdae61', '#fee08b', '#d9ef8b',
+            '#a6d96a', '#66bd63', '#1a9850', '#006837', '#004529'
+        ],
+        'labels': [
+            'No Data', 'Very Low', 'Low', 'Fair', 'Moderate', 'Good',
+            'Very Good', 'Excellent', 'Dense', 'Very Dense', 'Extreme'
+        ]
+    },
+    'VH_VV': {
+        'palette': [
+            '#ffffff', '#d73027', '#f46d43', '#fdae61', '#fee08b', '#d9ef8b',
+            '#a6d96a', '#66bd63', '#1a9850', '#006837', '#004529'
+        ],
+        'labels': [
+            'No Data', 'Very Low Growth', 'Low', 'Fair', 'Moderate', 'Good',
+            'Very Good', 'Strong Growth', 'Dense', 'Very Dense', 'Extreme'
+        ]
+    },
+    'VV_VH': {
+        'palette': [
+            '#ffffff', '#d73027', '#f46d43', '#fdae61', '#fee08b', '#d9ef8b',
+            '#a6d96a', '#66bd63', '#1a9850', '#006837', '#004529'
+        ],
+        'labels': [
+            'No Data', 'Very Soft', 'Soft', 'Fair', 'Moderate', 'Structured',
+            'Firm', 'Strong Structure', 'Dense', 'Very Dense', 'Extreme'
+        ]
+    },
+    'VV': {
+        'palette': [
+            '#ffffff', '#08306b', '#2171b5', '#6baed6', '#c6dbef', '#ffffcc',
+            '#fed976', '#fd8d3c', '#e31a1c', '#bd0026', '#800026'
+        ],
+        'labels': [
+            'No Data', 'Flooded', 'Very Wet', 'Wet', 'Moist Soil', 'Moderate',
+            'Drier', 'Dry', 'Very Dry', 'Hard Surface', 'Extreme'
+        ]
+    },
+    'VH': {
+        'palette': [
+            '#ffffff', '#d73027', '#f46d43', '#fdae61', '#fee08b', '#d9ef8b',
+            '#a6d96a', '#66bd63', '#1a9850', '#006837', '#004529'
+        ],
+        'labels': [
+            'No Data', 'Bare / Sparse', 'Very Low Biomass', 'Low', 'Fair', 'Moderate',
+            'Good Canopy', 'Dense Canopy', 'High Biomass', 'Very High', 'Extreme'
+        ]
+    },
+    'SDWI': {
+        'palette': [
+            '#ffffff', '#08306b', '#08519c', '#2171b5', '#4292c6', '#6baed6',
+            '#9ecae1', '#c6dbef', '#deebf7', '#ffffcc', '#fee08b'
+        ],
+        'labels': [
+            'No Data', 'Waterlogged', 'Flooded', 'Very Wet', 'Wet', 'Moist',
+            'Moderate', 'Drier', 'Dry', 'Very Dry', 'Upland'
+        ]
+    },
+    'SIGMA0_VV': {
+        'palette': [
+            '#ffffff', '#ffffcc', '#ffeda0', '#fed976', '#feb24c', '#fd8d3c',
+            '#fc4e2a', '#e31a1c', '#bd0026', '#800026', '#4d0019'
+        ],
+        'labels': [
+            'No Data', 'Very Weak σ⁰', 'Weak', 'Low', 'Moderate', 'Medium',
+            'Strong', 'Very Strong', 'High', 'Very High', 'Extreme'
+        ]
+    },
+    'SIGMA0_VH': {
+        'palette': [
+            '#ffffff', '#ffffcc', '#ffeda0', '#fed976', '#feb24c', '#fd8d3c',
+            '#fc4e2a', '#e31a1c', '#bd0026', '#800026', '#4d0019'
+        ],
+        'labels': [
+            'No Data', 'Very Weak σ⁰', 'Weak', 'Low', 'Moderate', 'Medium',
+            'Strong', 'Very Strong', 'High', 'Very High', 'Extreme'
+        ]
+    },
+    'GAMMA0_VV': {
+        'palette': [
+            '#ffffff', '#ffffcc', '#ffeda0', '#fed976', '#feb24c', '#fd8d3c',
+            '#fc4e2a', '#e31a1c', '#bd0026', '#800026', '#4d0019'
+        ],
+        'labels': [
+            'No Data', 'Very Weak γ⁰', 'Weak', 'Low', 'Moderate', 'Medium',
+            'Strong', 'Very Strong', 'High', 'Very High', 'Extreme'
+        ]
+    },
+    'GAMMA0_VH': {
+        'palette': [
+            '#ffffff', '#ffffcc', '#ffeda0', '#fed976', '#feb24c', '#fd8d3c',
+            '#fc4e2a', '#e31a1c', '#bd0026', '#800026', '#4d0019'
+        ],
+        'labels': [
+            'No Data', 'Very Weak γ⁰', 'Weak', 'Low', 'Moderate', 'Medium',
+            'Strong', 'Very Strong', 'High', 'Very High', 'Extreme'
+        ]
+    },
 }
 
 PALETTE_MAP = {
@@ -411,6 +562,21 @@ PALETTE_MAP = {
     'NDMI': (index_palettes_labels['NDMI']['palette'], index_palettes_labels['NDMI']['labels']),
     'NDWI': (index_palettes_labels['NDWI']['palette'], index_palettes_labels['NDWI']['labels']),
     'SMI': (index_palettes_labels['SMI']['palette'], index_palettes_labels['SMI']['labels']),
+    'RVI': (index_palettes_labels['RVI']['palette'], index_palettes_labels['RVI']['labels']),
+    'VH_VV': (index_palettes_labels['VH_VV']['palette'], index_palettes_labels['VH_VV']['labels']),
+    'VV_VH': (index_palettes_labels['VV_VH']['palette'], index_palettes_labels['VV_VH']['labels']),
+    'VV': (index_palettes_labels['VV']['palette'], index_palettes_labels['VV']['labels']),
+    'VH': (index_palettes_labels['VH']['palette'], index_palettes_labels['VH']['labels']),
+    'SDWI': (index_palettes_labels['SDWI']['palette'], index_palettes_labels['SDWI']['labels']),
+    'SIGMA0_VV': (index_palettes_labels['SIGMA0_VV']['palette'], index_palettes_labels['SIGMA0_VV']['labels']),
+    'SIGMA0_VH': (index_palettes_labels['SIGMA0_VH']['palette'], index_palettes_labels['SIGMA0_VH']['labels']),
+    'GAMMA0_VV': (index_palettes_labels['GAMMA0_VV']['palette'], index_palettes_labels['GAMMA0_VV']['labels']),
+    'GAMMA0_VH': (index_palettes_labels['GAMMA0_VH']['palette'], index_palettes_labels['GAMMA0_VH']['labels']),
+    # legacy aliases
+    'VV_DB': (index_palettes_labels['VV']['palette'], index_palettes_labels['VV']['labels']),
+    'VH_DB': (index_palettes_labels['VH']['palette'], index_palettes_labels['VH']['labels']),
+    'SIGMA0': (index_palettes_labels['SIGMA0_VV']['palette'], index_palettes_labels['SIGMA0_VV']['labels']),
+    'GAMMA0': (index_palettes_labels['GAMMA0_VV']['palette'], index_palettes_labels['GAMMA0_VV']['labels']),
     'TRUE_COLOR': (["#000000"], ["True Color"]),
 }
 
@@ -447,6 +613,50 @@ def prefer_http_from_asset(asset) -> Optional[str]:
         return href
     return s3_to_https(href) if href else None
 
+
+def is_s1_index(index_name: str) -> bool:
+    name = (index_name or "").upper().replace("/", "_").replace(" ", "_")
+    return name in S1_INDICES or name in S1_INDEX_ALIASES
+
+
+def normalize_s1_index(index_name: str) -> str:
+    """Map aliases (VV_DB, SIGMA0, VV/VH) to canonical S1 index names."""
+    name = (index_name or "").upper().replace("/", "_").replace(" ", "_")
+    return S1_INDEX_ALIASES.get(name, name)
+
+
+def is_optical_index(index_name: str) -> bool:
+    return (index_name or "").upper() in OPTICAL_INDICES
+
+
+def resolve_asset(assets: Dict[str, Any], band_key: str):
+    """Resolve a STAC asset for a logical band key (handles vv/vh aliases)."""
+    if not assets or not band_key:
+        return None
+    key_u = band_key.upper()
+    aliases = BAND_ASSET_ALIASES.get(key_u) or (band_key, band_key.lower(), key_u)
+    for name in aliases:
+        asset = assets.get(name)
+        if asset is not None:
+            return asset
+    return None
+
+
+def _s1_dn_to_power(arr: np.ndarray) -> np.ndarray:
+    """Convert Sentinel-1 GRD amplitude DN to linear power; 0/nodata -> NaN."""
+    a = arr.astype("float32", copy=False)
+    nodata = ~np.isfinite(a) | (a <= 0)
+    finite = a[~nodata]
+    if finite.size and float(np.nanmax(finite)) <= 2.0:
+        # Already linear / calibrated intensity
+        power = np.where(nodata, np.nan, np.maximum(a, 0.0)).astype("float32")
+    else:
+        # GRD DN is amplitude -> intensity = DN^2
+        power = np.square(np.maximum(a, 0.0)).astype("float32")
+        power[nodata] = np.nan
+    return power
+
+
 def compute_index_array_by_name(index_name: str, bands: Dict[str, np.ndarray]) -> np.ndarray:
     for k in list(bands.keys()):
         if bands[k] is not None:
@@ -455,6 +665,48 @@ def compute_index_array_by_name(index_name: str, bands: Dict[str, np.ndarray]) -
     eps = 1e-6
     def missing(*args):
         return any(arg is None for arg in args)
+
+    # --- Sentinel-1 radar indices ---
+    if is_s1_index(name):
+        name = normalize_s1_index(name)
+        vv_raw = bands.get("VV") if bands.get("VV") is not None else bands.get("vv")
+        vh_raw = bands.get("VH") if bands.get("VH") is not None else bands.get("vh")
+
+        needs_both = name in {"RVI", "VH_VV", "VV_VH", "SDWI"}
+        needs_vv = name in {"VV", "VV_DB", "SIGMA0_VV", "GAMMA0_VV", "SIGMA0", "GAMMA0"} or needs_both
+        needs_vh = name in {"VH", "VH_DB", "SIGMA0_VH", "GAMMA0_VH"} or needs_both
+
+        if needs_both and missing(vv_raw, vh_raw):
+            raise ValueError(f"{name} requires VV and VH")
+        if needs_vv and not needs_both and vv_raw is None:
+            raise ValueError(f"{name} requires VV")
+        if needs_vh and not needs_both and vh_raw is None:
+            raise ValueError(f"{name} requires VH")
+
+        vv_p = _s1_dn_to_power(vv_raw) if vv_raw is not None else None
+        vh_p = _s1_dn_to_power(vh_raw) if vh_raw is not None else None
+
+        def _to_db(power: np.ndarray) -> np.ndarray:
+            return (10.0 * np.log10(power + eps)).astype("float32")
+
+        if name == "RVI":
+            # Dual-pol Radar Vegetation Index (Kim & van Zyl): 4*VH/(VV+VH)
+            return (4.0 * vh_p) / (vv_p + vh_p + eps)
+        if name == "VH_VV":
+            # Crop growth proxy
+            return vh_p / (vv_p + eps)
+        if name == "VV_VH":
+            # Crop structure proxy
+            return vv_p / (vh_p + eps)
+        if name == "SDWI":
+            # Sentinel-1 Dual-pol Water Index: ln(10 * VV * VH)
+            return np.log(10.0 * vv_p * vh_p + eps).astype("float32")
+        if name in {"VV", "SIGMA0_VV", "GAMMA0_VV"}:
+            # VV / σ⁰ / γ⁰ in dB (RTC product is γ⁰; σ⁰ name kept for API clarity)
+            return _to_db(vv_p)
+        if name in {"VH", "SIGMA0_VH", "GAMMA0_VH"}:
+            return _to_db(vh_p)
+        raise ValueError(f"Unsupported S1 index: {name}")
 
     if name == "NDVI":
         NIR, RED = bands.get("B08"), bands.get("B04")
@@ -684,10 +936,51 @@ def quick_keep_pct(item, aoi_geojson):
     except Exception:
         return 0.0, False
 
+
+def quick_keep_pct_s1(item, aoi_geojson):
+    """AOI coverage score for Sentinel-1 GRD (VV/VH); no SCL/cloud masking."""
+    item_id = getattr(item, "id", None) or ""
+    geom_key = json.dumps(aoi_geojson, sort_keys=True)
+    cache_key = f"s1|{item_id}|{hash(geom_key)}"
+    now = time.time()
+    cached = _KEEP_PCT_CACHE.get(cache_key)
+    if cached and now - cached[0] < _KEEP_PCT_CACHE_TTL:
+        return cached[1], cached[2]
+
+    assets = item.assets or {}
+    vv_asset = resolve_asset(assets, "VV")
+    vv = prefer_http_from_asset(vv_asset)
+    if not vv:
+        return 0.0, False
+    try:
+        with rasterio.Env():
+            with rasterio.open(sign_href_if_pc(vv)) as ds:
+                aoi_sc = aoi_to_scene(aoi_geojson, ds.crs.to_string())
+                win = from_bounds(*aoi_sc.bounds, ds.transform).round_offsets().round_lengths()
+                if win.width <= 0 or win.height <= 0:
+                    return 0.0, False
+                th = max(1, min(64, int(win.height)))
+                tw = max(1, min(64, int(win.width)))
+                sub = Window(win.col_off, win.row_off, win.width, win.height)
+                arr = ds.read(1, window=sub, out_shape=(th, tw), resampling=Resampling.nearest, masked=True).filled(0).astype("float32")
+                tr = win_transform(sub, ds.transform) * Affine.scale(win.width / float(tw), win.height / float(th))
+                mask = geometry_mask([mapping(aoi_sc)], out_shape=(th, tw), transform=tr, invert=True)
+                valid = np.isfinite(arr) & (arr > 0) & (arr > -1000) & mask
+                kept = np.count_nonzero(valid)
+                total = np.count_nonzero(mask)
+                result = (kept / max(total, 1)) * 100.0, False
+                _KEEP_PCT_CACHE[cache_key] = (now, result[0], result[1])
+                return result
+    except Exception:
+        return 0.0, False
+
+
 # pick best item
 def pick_best_item(aoi_geojson, start, end, prefer_pc=True, satellite="s2"):
     collections_try = get_collections_for_satellite(satellite)
-    search_order = ["planetary", "aws"] if prefer_pc else ["aws", "planetary"]
+    is_s1 = (satellite or "s2").lower().startswith("s1")
+    # Sentinel-1 GRD is reliably on Planetary Computer.
+    search_order = ["planetary", "aws"] if (prefer_pc or is_s1) else ["aws", "planetary"]
     dt = f"{start}/{end}"
     items = search_stac_items(collections_try, aoi_geojson, dt, limit=12, search_order=search_order)
     if not items:
@@ -699,10 +992,11 @@ def pick_best_item(aoi_geojson, start, end, prefer_pc=True, satellite="s2"):
     if not items:
         return None, False, None
 
+    score_fn = quick_keep_pct_s1 if is_s1 else quick_keep_pct
     scored = []
     workers = min(THREADS, max(1, len(items)))
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(quick_keep_pct, it, aoi_geojson): it for it in items}
+        futs = {ex.submit(score_fn, it, aoi_geojson): it for it in items}
         for f in as_completed(futs):
             try:
                 pct, has_scl = f.result()
@@ -735,9 +1029,10 @@ def _read_tile_into_stack(item, aoi_geojson, dst_transform, H, W, want_scl, requ
     out = {"used": False, "bands": {}, "S": None, "id": getattr(item, "id", None)}
     assets = item.assets or {}
     required_bands = list(dict.fromkeys(required_bands or ["B04", "B08"]))
+    is_radar = any((b or "").upper() in S1_BANDS for b in required_bands)
 
     def first_asset_href(assets_dict):
-        for k in ("red", "B04", "B04.jp2", "B04.tif", "B04.TIF"):
+        for k in ("vv", "VV", "red", "B04", "B04.jp2", "B04.tif", "B04.TIF"):
             a = assets_dict.get(k)
             if a:
                 h = prefer_http_from_asset(a)
@@ -750,18 +1045,21 @@ def _read_tile_into_stack(item, aoi_geojson, dst_transform, H, W, want_scl, requ
         return None
 
     primary_asset = prefer_http_from_asset(
-        assets.get("red") or assets.get("B04") or assets.get("RED") or first_asset_href(assets)
-    )
+        resolve_asset(assets, "VV")
+        or assets.get("red")
+        or assets.get("B04")
+        or assets.get("RED")
+    ) or first_asset_href(assets)
     if not primary_asset:
         return out
 
     scl_ref = assets.get("scl") or assets.get("SCL")
-    scl_url = prefer_http_from_asset(scl_ref) if (want_scl and scl_ref) else None
+    scl_url = prefer_http_from_asset(scl_ref) if (want_scl and not is_radar and scl_ref) else None
     scl_url = sign_href_if_pc(scl_url) if scl_url else None
 
     band_urls: Dict[str, Optional[str]] = {}
     for bkey in required_bands:
-        a = assets.get(bkey) or assets.get(bkey.lower())
+        a = resolve_asset(assets, bkey)
         url = prefer_http_from_asset(a) if a else None
         band_urls[bkey] = sign_href_if_pc(url) if url else None
 
@@ -788,7 +1086,12 @@ def _read_tile_into_stack(item, aoi_geojson, dst_transform, H, W, want_scl, requ
                 try:
                     with rasterio.open(url) as ds:
                         arr = read_band_window(ds, aoi_sc, H, W, dst_transform, Resampling.bilinear)
-                        if np.isfinite(arr).any() and np.nanmax(arr) > 1.5:
+                        if is_radar:
+                            # RTC: float gamma0 with nodata ~-32768. GRD: uint16 DN, 0=nodata.
+                            # Do NOT apply optical 1/10000 reflectance scaling.
+                            arr = arr.astype("float32", copy=False)
+                            arr[(~np.isfinite(arr)) | (arr <= 0) | (arr < -1000)] = np.nan
+                        elif np.isfinite(arr).any() and np.nanmax(arr) > 1.5:
                             arr *= 1 / 10000.0
                         return bkey, arr
                 except Exception:
@@ -945,10 +1248,11 @@ def render_spread_png_fast(bins_canvas: np.ndarray, NDVI_canvas: np.ndarray, res
 
 def temporal_fill_median(band_key: str, items: List[Any], aoi_geojson, dst_transform, H, W, want_scl=False, max_items=6):
     stacks = []
+    is_radar = (band_key or "").upper() in S1_BANDS
 
     def _read_item(it):
         assets = it.assets or {}
-        a = assets.get(band_key) or assets.get(band_key.lower())
+        a = resolve_asset(assets, band_key)
         url = prefer_http_from_asset(a) if a else None
         if not url:
             return None
@@ -964,7 +1268,10 @@ def temporal_fill_median(band_key: str, items: List[Any], aoi_geojson, dst_trans
                         dst_transform,
                         Resampling.bilinear,
                     )
-                    if np.nanmax(arr) > 1.5:
+                    if is_radar:
+                        arr = arr.astype("float32", copy=False)
+                        arr[(~np.isfinite(arr)) | (arr <= 0) | (arr < -1000)] = np.nan
+                    elif np.nanmax(arr) > 1.5:
                         arr *= 1 / 10000.0
                     return np.where(np.isfinite(arr), arr, np.nan)
         except Exception:

@@ -80,16 +80,20 @@ def calculate_index(req: CalculateRequest):
     satellite = (req.satellite or "s2").lower()
     search_order = utils.get_provider_search_order(req.provider, prefer_pc_default=True)
     prefer_pc = search_order[0] == "planetary"
+    is_s1 = satellite.startswith("s1")
 
-    # Sentinel-1 cannot compute optical indices like NDVI, EVI, etc.
-    OPTICAL_INDICES = {
-        "NDVI", "EVI", "EVI2", "SAVI", "MSAVI", "NDMI", "NDWI", "SMI",
-        "CCC", "NITROGEN", "SOC", "NDRE", "RECI", "TRUE_COLOR"
-    }
-    if satellite.startswith("s1") and index_name in OPTICAL_INDICES:
+    if utils.is_s1_index(index_name):
+        index_name = utils.normalize_s1_index(index_name)
+
+    if is_s1 and utils.is_optical_index(index_name):
         raise HTTPException(
             status_code=400,
             detail=f"Index {index_name} is not available for Sentinel-1 (radar). Use Sentinel-2 (s2) for optical indices."
+        )
+    if (not is_s1) and utils.is_s1_index(index_name):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Index {index_name} requires Sentinel-1 (radar). Set satellite to \"s1\"."
         )
 
     index_band_map = {
@@ -107,9 +111,32 @@ def calculate_index(req: CalculateRequest):
         'NDRE': ['B8A', 'B05'],
         'RECI': ['B08', 'B05'],
         'TRUE_COLOR': ['B04', 'B03', 'B02'],
+        # Sentinel-1 radar indices (cloudy-day / all-weather)
+        'VV': ['VV'],                 # soil moisture, flooding (dB)
+        'VH': ['VH'],                 # crop biomass, canopy (dB)
+        'VV_VH': ['VV', 'VH'],        # crop structure
+        'VH_VV': ['VV', 'VH'],        # crop growth
+        'RVI': ['VV', 'VH'],          # vegetation vigor
+        'SDWI': ['VV', 'VH'],         # waterlogging
+        'SIGMA0_VV': ['VV'],          # σ⁰ VV (dB)
+        'SIGMA0_VH': ['VH'],          # σ⁰ VH (dB)
+        'GAMMA0_VV': ['VV'],          # γ⁰ VV (dB) — RTC native
+        'GAMMA0_VH': ['VH'],          # γ⁰ VH (dB) — RTC native
     }
+    # Canonical S1 names for error messages (exclude legacy aliases already normalized away)
+    s1_public = [
+        "VV", "VH", "VV_VH", "VH_VV", "RVI", "SDWI",
+        "SIGMA0_VV", "SIGMA0_VH", "GAMMA0_VV", "GAMMA0_VH",
+    ]
     if index_name not in index_band_map:
-        raise HTTPException(status_code=400, detail=f"Unsupported index: {index_name}")
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported index: {index_name}. "
+                f"S2 optical: {[k for k in index_band_map if k not in utils.S1_INDICES]}. "
+                f"S1 radar: {s1_public}."
+            ),
+        )
     required_bands = index_band_map[index_name]
 
     cache_key = _request_cache_key(req, index_name)
@@ -135,7 +162,12 @@ def calculate_index(req: CalculateRequest):
         first_assets = item.assets or {}
         target_crs = utils.get_item_crs(item)
         if target_crs is None:
-            first_candidate = utils.prefer_http_from_asset(first_assets.get("red") or first_assets.get("B04"))
+            first_candidate = utils.prefer_http_from_asset(
+                utils.resolve_asset(first_assets, "VV")
+                or first_assets.get("red")
+                or first_assets.get("B04")
+                or utils.resolve_asset(first_assets, "VH")
+            )
             if not first_candidate:
                 for a in first_assets.values():
                     h = utils.prefer_http_from_asset(a)
@@ -148,6 +180,7 @@ def calculate_index(req: CalculateRequest):
             with rasterio.open(first_red) as fr:
                 target_crs = fr.crs
 
+        # S1 GRD is ~10m; keep same adaptive grid as S2
         aoi_sc, dst_transform, H, W, res_m = utils.build_adaptive_grid(target_crs, geom, native_res_m=10.0)
 
         coll_name = coll or utils.get_collections_for_satellite(satellite)[0]
@@ -263,7 +296,8 @@ def calculate_index(req: CalculateRequest):
                     fill_here = fill_mask & valid_fill
                     if np.any(fill_here):
                         for band in required_bands:
-                            if np.isfinite(median_bands[band]).any() and np.nanmax(median_bands[band]) > 1.5:
+                            # Optical reflectance scaling only — never apply to S1 DN
+                            if (not is_s1) and np.isfinite(median_bands[band]).any() and np.nanmax(median_bands[band]) > 1.5:
                                 median_bands[band] = median_bands[band] * (1 / 10000.0)
                             band_dict[band][fill_here] = median_bands[band][fill_here]
 
