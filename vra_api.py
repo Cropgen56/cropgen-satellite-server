@@ -17,6 +17,9 @@ def vra_analysis(req: VraAnalysisRequest):
             provider=req.provider,
             satellite=req.satellite,
             include_images=req.include_images,
+            n_zones=req.n_zones,
+            zone_method=req.zone_method,
+            min_patch_ha=req.min_patch_ha,
         )
         return VraAnalysisResponse(**result)
     except ValueError as exc:

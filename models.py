@@ -1,5 +1,5 @@
-from typing import Any, Dict, List, Optional
-from pydantic import BaseModel
+from typing import Any, Dict, List, Literal, Optional
+from pydantic import BaseModel, Field
 
 class AvailabilityRequest(BaseModel):
     geometry: Dict[str, Any]
@@ -124,6 +124,7 @@ class VraZoneRate(BaseModel):
     product: str
     product_dose_kg_ha: float
     total_product_kg: float
+    patch_count: int = 0
 
 
 class VraAnalysisRequest(BaseModel):
@@ -134,6 +135,9 @@ class VraAnalysisRequest(BaseModel):
     provider: Optional[str] = "both"
     satellite: Optional[str] = "s2"
     include_images: bool = True
+    n_zones: int = Field(default=5, ge=2, le=7)
+    zone_method: Literal["quantile", "kmeans"] = "quantile"
+    min_patch_ha: float = 0.05
 
 
 class VraAnalysisResponse(BaseModel):
@@ -142,6 +146,7 @@ class VraAnalysisResponse(BaseModel):
     cloud_cover: Optional[float] = None
     vra_rates: Dict[str, Dict[str, VraZoneRate]]
     soc_stats: SocStats
+    zone_geojson: Optional[Dict[str, Any]] = None
     images: Optional[Dict[str, str]] = None
     text_report: Optional[str] = None
     metadata: Dict[str, Any]
