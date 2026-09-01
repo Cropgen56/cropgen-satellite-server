@@ -1,27 +1,27 @@
 from fastapi import APIRouter, HTTPException
 
+import cropgen_soil_vra
 from models import VraAnalysisRequest, VraAnalysisResponse
-import vra_core
+from vra_service import run_vra
 
 router = APIRouter()
+
+
+@router.get("/crops")
+def list_crops():
+    crops = sorted(k for k in cropgen_soil_vra.CROP_DEMAND if k != "default")
+    return {"crops": crops, "default": cropgen_soil_vra.CROP_DEMAND["default"]}
+
+
+@router.get("/regions")
+def list_regions():
+    return cropgen_soil_vra.available_regions()
 
 
 @router.post("/analysis", response_model=VraAnalysisResponse)
 def vra_analysis(req: VraAnalysisRequest):
     try:
-        result = vra_core.run_vra_analysis(
-            geometry=req.geometry,
-            start_date=req.start_date,
-            end_date=req.end_date,
-            crop=req.crop,
-            provider=req.provider,
-            satellite=req.satellite,
-            include_images=req.include_images,
-            n_zones=req.n_zones,
-            zone_method=req.zone_method,
-            min_patch_ha=req.min_patch_ha,
-        )
-        return VraAnalysisResponse(**result)
+        return VraAnalysisResponse(**run_vra(req))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:

@@ -123,6 +123,15 @@ app.include_router(
     dependencies=[Depends(validate_api_key)],
 )
 
+# Same engine and routes as /vra (cropgen_soil_vra). Kept so older clients
+# that already call /soil-vra keep working.
+app.include_router(
+    vra_router,
+    prefix="/v4/api/soil-vra",
+    tags=["VRA"],
+    dependencies=[Depends(validate_api_key)],
+)
+
 @app.get("/")
 def root():
     return {"message": "CropGen API v4 is running"}

@@ -1,22 +1,35 @@
 from fastapi import APIRouter, HTTPException
 
-from models import SocAnalysisRequest, SocAnalysisResponse
-import vra_core
+from models import SocAnalysisRequest, SocAnalysisResponse, VraAnalysisRequest
+from vra_service import run_vra
 
 router = APIRouter()
 
 
 @router.post("/analysis", response_model=SocAnalysisResponse)
 def soc_analysis(req: SocAnalysisRequest):
+    """SOC extract from the same cropgen_soil_vra engine used by /vra/analysis."""
     try:
-        result = vra_core.run_soc_analysis(
+        vra_req = VraAnalysisRequest(
             geometry=req.geometry,
             start_date=req.start_date,
             end_date=req.end_date,
-            provider=req.provider,
-            satellite=req.satellite,
+            include_images=True,
+            include_prescription_geojson=False,
         )
-        return SocAnalysisResponse(**result)
+        payload = run_vra(vra_req)
+        images = payload.get("images") or {}
+        image = images.get("SOC")
+        soc_stats = payload.get("soc_stats")
+        if not image or not soc_stats:
+            raise RuntimeError("SOC map was not produced for this field / date range.")
+        return SocAnalysisResponse(
+            date=payload.get("date") or req.end_date,
+            cloud_cover=payload.get("cloud_cover"),
+            image_base64=image,
+            soc_stats=soc_stats,
+            metadata=payload.get("metadata") or {},
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:

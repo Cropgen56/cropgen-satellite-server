@@ -99,13 +99,15 @@ class SocClassStat(BaseModel):
 
 
 class SocStats(BaseModel):
-    mean_pct: float
-    min_pct: float
-    max_pct: float
-    std_pct: float
-    total_area_ha: float
-    total_area_acres: float
-    classes: Dict[str, SocClassStat]
+    mean_pct: Optional[float] = None
+    min_pct: Optional[float] = None
+    max_pct: Optional[float] = None
+    std_pct: Optional[float] = None
+    total_area_ha: Optional[float] = None
+    total_area_acres: Optional[float] = None
+    classes: Dict[str, SocClassStat] = {}
+    unit: Optional[str] = None
+    confidence: Optional[str] = None
 
 
 class SocAnalysisResponse(BaseModel):
@@ -116,37 +118,76 @@ class SocAnalysisResponse(BaseModel):
     metadata: Dict[str, Any]
 
 
-class VraZoneRate(BaseModel):
-    pixel_count: int
-    area_ha: float
-    area_acres: float
-    nutrient_dose_kg_ha: float
-    product: str
-    product_dose_kg_ha: float
-    total_product_kg: float
-    patch_count: int = 0
+class VraGroundSample(BaseModel):
+    lat: float
+    lon: float
+    SOC: Optional[float] = None
+    N: Optional[float] = None
+    P: Optional[float] = None
+    K: Optional[float] = None
+    PH: Optional[float] = None
+    EC: Optional[float] = None
+    MOISTURE: Optional[float] = None
+    CLAY: Optional[float] = None
+
+    class Config:
+        extra = "allow"
 
 
 class VraAnalysisRequest(BaseModel):
+    """Request body for cropgen_soil_vra.run_analysis."""
+
     geometry: Dict[str, Any]
     start_date: str
     end_date: str
     crop: str = "wheat"
-    provider: Optional[str] = "both"
-    satellite: Optional[str] = "s2"
-    include_images: bool = True
     n_zones: int = Field(default=5, ge=2, le=7)
-    zone_method: Literal["quantile", "kmeans"] = "quantile"
     min_patch_ha: float = 0.05
+    include_images: bool = True
+    include_prescription_geojson: bool = False
+    label_mode: Literal["percent", "dose"] = "percent"
+    ground_samples: Optional[List[VraGroundSample]] = None
+    max_scenes: Optional[int] = Field(default=None, ge=2, le=40)
+    district: Optional[str] = None
+    state: Optional[str] = None
+    auto_region: bool = True
+    use_soilgrids: bool = False
+    grid_cell_m: float = Field(default=20.0, ge=10.0, le=100.0)
+    soc_method: Literal["published", "legacy"] = "published"
+    zone_features: Optional[List[str]] = None
+    # Ignored by the engine; kept so older clients do not 422.
+    provider: Optional[str] = None
+    satellite: Optional[str] = None
+    zone_method: Optional[str] = None
+
+
+class VraParamStat(BaseModel):
+    mean: Optional[float] = None
+    min: Optional[float] = None
+    max: Optional[float] = None
+    std: Optional[float] = None
+    unit: Optional[str] = None
+    source_composite: Optional[str] = None
+    confidence: Optional[str] = None
 
 
 class VraAnalysisResponse(BaseModel):
-    date: str
     crop: str
+    date: Optional[str] = None
     cloud_cover: Optional[float] = None
-    vra_rates: Dict[str, Dict[str, VraZoneRate]]
-    soc_stats: SocStats
+    param_stats: Dict[str, VraParamStat]
+    relative_index_note: Optional[str] = None
+    vra_rates: Dict[str, Any]
+    soc_stats: Optional[SocStats] = None
     zone_geojson: Optional[Dict[str, Any]] = None
+    prescription_grid: Optional[Dict[str, Any]] = None
+    prescription_geojson: Optional[Dict[str, Any]] = None
+    region: Optional[Dict[str, Any]] = None
+    soc_composite: Optional[Dict[str, Any]] = None
+    zone_info: Optional[Dict[str, Any]] = None
+    calibration: Optional[Dict[str, Any]] = None
+    correlation: Optional[Dict[str, Any]] = None
+    scenes_used: Optional[List[Dict[str, Any]]] = None
     images: Optional[Dict[str, str]] = None
     text_report: Optional[str] = None
     metadata: Dict[str, Any]
