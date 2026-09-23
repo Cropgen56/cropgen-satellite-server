@@ -17,6 +17,7 @@ from utils import (
     get_provider_search_order,
     sign_band_assets,
     read_bands_window_parallel,
+    resolve_asset,
 )
 
 router = APIRouter()
@@ -29,6 +30,7 @@ DEFAULT_MAX_POINTS = 8
 MAX_RETURN_POINTS = 16
 MAX_SEARCH_ITEMS = 24
 RESPONSE_CACHE_TTL_SECONDS = 10 * 60
+MAX_CLOUD_PCT = 60.0
 _RESPONSE_CACHE: Dict[str, tuple[float, Dict[str, Any]]] = {}
 
 class TSRequest(BaseModel):
@@ -113,6 +115,9 @@ def _pick_best_items(items: List[Any], max_points: int) -> List[Any]:
         date_key = _item_date(item)
         if not date_key:
             continue
+        # Drop scenes that would be rejected later anyway (999 = unknown cloud, kept).
+        if MAX_CLOUD_PCT < _item_cloud(item) < 999.0:
+            continue
         existing = by_date.get(date_key)
         if existing is None or _item_cloud(item) < _item_cloud(existing):
             by_date[date_key] = item
@@ -147,8 +152,8 @@ def _signed_asset_map(item, needed):
     return sign_band_assets(item, needed)
 
 def _item_has_required_assets(item, required_bands):
-    assets_keys = set(k.lower() for k in (item.assets or {}).keys())
-    return required_bands.issubset(assets_keys)
+    assets = item.assets or {}
+    return all(resolve_asset(assets, b) is not None for b in required_bands)
 
 def _read_bands_from_signed(signed_assets, needed, geom, out_h=16, out_w=16):
     band_urls = {b: signed_assets.get(b.lower()) or signed_assets.get(b) for b in needed}
@@ -161,7 +166,7 @@ def _compute_index_for_item(item, geom, idx, out_h=SAMPLE_SIZE, out_w=SAMPLE_SIZ
         cloud = item.properties.get("eo:cloud_cover") or item.properties.get("cloud_cover")
         if cloud is not None:
             try:
-                if float(cloud) > 60.0:
+                if float(cloud) > MAX_CLOUD_PCT:
                     return None
             except Exception:
                 pass

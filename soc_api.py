@@ -17,7 +17,7 @@ def soc_analysis(req: SocAnalysisRequest):
             include_images=True,
             include_prescription_geojson=False,
         )
-        payload = run_vra(vra_req)
+        payload = run_vra(vra_req, image_keys={"SOC"})
         images = payload.get("images") or {}
         image = images.get("SOC")
         soc_stats = payload.get("soc_stats")

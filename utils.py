@@ -46,6 +46,7 @@ os.environ.setdefault("GDAL_CACHEMAX", "1024")
 
 EARTH_SEARCH_AWS = "https://earth-search.aws.element84.com/v1"
 PLANETARY_STAC = "https://planetarycomputer.microsoft.com/api/stac/v1"
+PLANETARY_UNSUPPORTED_COLLECTIONS = {"sentinel-2-l1c"}
 SENTINEL1_COLLECTION = "sentinel-1-rtc"  # terrain-corrected, CRS-ready (GRD is GCP-only)
 SENTINEL2_COLLECTIONS = ["sentinel-2-l2a", "sentinel-2-l1c"]
 
@@ -150,6 +151,21 @@ STAC_METADATA_FIELDS = {
 }
 
 
+# Search results are shared across endpoints (availability, timeseries and
+# index maps usually hit the same field + dates back to back).
+_SEARCH_CACHE: Dict[str, Tuple[float, List[Any]]] = {}
+_SEARCH_CACHE_TTL = 5 * 60
+_SEARCH_CACHE_MAX = 256
+# Long-lived pool so a slow fallback provider never blocks the response.
+_SEARCH_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="stac-search")
+
+
+def _search_provider(provider, collections, intersects, dt, limit, metadata_only):
+    if provider == "planetary":
+        return search_planetary(collections, intersects, dt, limit, metadata_only)
+    return search_aws(collections, intersects, dt, limit, metadata_only)
+
+
 def search_stac_items(
     collections: List[str],
     intersects: Dict[str, Any],
@@ -158,33 +174,35 @@ def search_stac_items(
     search_order: Optional[List[str]] = None,
     metadata_only: bool = False,
 ) -> List[Any]:
-    """Search STAC providers in parallel while preserving provider preference order."""
+    """Search STAC providers in parallel, returning the first non-empty result in preference order."""
     order = search_order or ["planetary", "aws"]
     unique_order = list(dict.fromkeys(order))
-    if len(unique_order) == 1:
-        provider = unique_order[0]
-        if provider == "planetary":
-            return search_planetary(collections, intersects, dt, limit=limit, metadata_only=metadata_only)
-        return search_aws(collections, intersects, dt, limit=limit, metadata_only=metadata_only)
+    cache_key = json.dumps(
+        [collections, intersects, dt, limit, unique_order, metadata_only], sort_keys=True, default=str
+    )
+    now = time.time()
+    cached = _SEARCH_CACHE.get(cache_key)
+    if cached and now - cached[0] < _SEARCH_CACHE_TTL:
+        return list(cached[1])
 
-    futures: Dict[str, Any] = {}
-    with ThreadPoolExecutor(max_workers=len(unique_order)) as ex:
-        for provider in unique_order:
-            if provider == "planetary":
-                futures[provider] = ex.submit(
-                    search_planetary, collections, intersects, dt, limit, metadata_only
-                )
-            elif provider == "aws":
-                futures[provider] = ex.submit(
-                    search_aws, collections, intersects, dt, limit, metadata_only
-                )
-        results = {provider: futures[provider].result() for provider in futures}
-
+    futures = {
+        provider: _SEARCH_POOL.submit(
+            _search_provider, provider, collections, intersects, dt, limit, metadata_only
+        )
+        for provider in unique_order
+    }
+    items: List[Any] = []
     for provider in unique_order:
-        items = results.get(provider) or []
+        # Don't wait for a lower-priority provider once a preferred one has answered.
+        items = futures[provider].result() or []
         if items:
-            return items
-    return []
+            break
+
+    if items:
+        if len(_SEARCH_CACHE) >= _SEARCH_CACHE_MAX:
+            _SEARCH_CACHE.pop(next(iter(_SEARCH_CACHE)), None)
+        _SEARCH_CACHE[cache_key] = (now, list(items))
+    return items
 
 
 def get_item_crs(item) -> Optional[CRS]:
@@ -831,7 +849,9 @@ def _stac_search_kwargs(collections, intersects, dt, limit, metadata_only: bool)
         "collections": collections,
         "intersects": intersects,
         "datetime": dt,
-        "limit": limit,
+        # `limit` is the STAC page size; pystac-client still pages through every
+        # match, so a small page only adds sequential round trips.
+        "limit": max(int(limit or 0), 100),
     }
     if metadata_only:
         kwargs["fields"] = STAC_METADATA_FIELDS
@@ -839,6 +859,15 @@ def _stac_search_kwargs(collections, intersects, dt, limit, metadata_only: bool)
 
 
 def search_planetary(collections, intersects, dt, limit=50, metadata_only: bool = False):
+    # Planetary does not host L1C and rejects searches spanning multiple collections.
+    collections = [c for c in collections if c not in PLANETARY_UNSUPPORTED_COLLECTIONS]
+    if not collections:
+        return []
+    if len(collections) > 1:
+        items = []
+        for c in collections:
+            items.extend(search_planetary([c], intersects, dt, limit=limit, metadata_only=metadata_only))
+        return items
     search_kwargs = _stac_search_kwargs(collections, intersects, dt, limit, metadata_only)
     try:
         cat = get_planetary_client()
@@ -903,8 +932,13 @@ def quick_keep_pct(item, aoi_geojson):
         return 0.0, False
     try:
         with rasterio.Env():
-            with rasterio.open(sign_href_if_pc(red)) as rsrc, rasterio.open(sign_href_if_pc(nir)) as nsrc, \
-                 (rasterio.open(sign_href_if_pc(scl_url)) if scl_url else nullcontext()) as sds:
+            # Open all three COGs concurrently: each open is a network round trip.
+            urls = [sign_href_if_pc(u) for u in (red, nir, scl_url) if u]
+            with ThreadPoolExecutor(max_workers=len(urls)) as ex:
+                opened = list(ex.map(rasterio.open, urls))
+            rsrc, nsrc = opened[0], opened[1]
+            sds = opened[2] if scl_url else None
+            with rsrc, nsrc, (sds or nullcontext()):
                 crs = rsrc.crs or nsrc.crs
                 aoi_sc = aoi_to_scene(aoi_geojson, crs.to_string())
                 win = from_bounds(*aoi_sc.bounds, rsrc.transform).round_offsets().round_lengths()
@@ -912,8 +946,12 @@ def quick_keep_pct(item, aoi_geojson):
                     return 0.0, bool(sds)
                 th = max(1, min(64, int(win.height))); tw = max(1, min(64, int(win.width)))
                 sub = Window(win.col_off, win.row_off, win.width, win.height)
-                R = rsrc.read(1, window=sub, out_shape=(th, tw), resampling=Resampling.nearest, masked=True).filled(0).astype("float32")
-                N = nsrc.read(1, window=sub, out_shape=(th, tw), resampling=Resampling.nearest, masked=True).filled(0).astype("float32")
+
+                def _read_small(src):
+                    return src.read(1, window=sub, out_shape=(th, tw), resampling=Resampling.nearest, masked=True).filled(0).astype("float32")
+
+                with ThreadPoolExecutor(max_workers=2) as ex:
+                    R, N = ex.map(_read_small, (rsrc, nsrc))
                 if R.max() > 1.5 or N.max() > 1.5:
                     R *= 1/10000.0; N *= 1/10000.0
                 den = (N + R); den[den == 0] = np.nan
@@ -975,6 +1013,25 @@ def quick_keep_pct_s1(item, aoi_geojson):
         return 0.0, False
 
 
+def _item_collection_id(it):
+    try:
+        col = getattr(it, "collection", None)
+        if isinstance(col, str):
+            return col
+        if hasattr(col, "id"):
+            return col.id
+    except Exception:
+        pass
+    try:
+        props = getattr(it, "properties", {}) or {}
+        for k in ("collection", "collection_id"):
+            if k in props:
+                return props[k]
+    except Exception:
+        pass
+    return None
+
+
 # pick best item
 def pick_best_item(aoi_geojson, start, end, prefer_pc=True, satellite="s2"):
     collections_try = get_collections_for_satellite(satellite)
@@ -992,6 +1049,13 @@ def pick_best_item(aoi_geojson, start, end, prefer_pc=True, satellite="s2"):
     if not items:
         return None, False, None
 
+    if len(items) == 1:
+        # Nothing to rank: skip the coverage probe (several COG reads).
+        only = items[0]
+        assets = getattr(only, "assets", {}) or {}
+        has_scl = (not is_s1) and bool(assets.get("scl") or assets.get("SCL"))
+        return only, has_scl, _item_collection_id(only)
+
     score_fn = quick_keep_pct_s1 if is_s1 else quick_keep_pct
     scored = []
     workers = min(THREADS, max(1, len(items)))
@@ -1005,24 +1069,7 @@ def pick_best_item(aoi_geojson, start, end, prefer_pc=True, satellite="s2"):
             scored.append((pct, futs[f], has_scl))
     scored.sort(key=lambda x: x[0], reverse=True)
     best = scored[0]
-    def get_collection_id(it):
-        try:
-            col = getattr(it, "collection", None)
-            if isinstance(col, str):
-                return col
-            if hasattr(col, "id"):
-                return col.id
-        except Exception:
-            pass
-        try:
-            props = getattr(it, "properties", {}) or {}
-            for k in ("collection", "collection_id"):
-                if k in props:
-                    return props[k]
-        except Exception:
-            pass
-        return None
-    return best[1], best[2], get_collection_id(best[1])
+    return best[1], best[2], _item_collection_id(best[1])
 
 # read tile
 def _read_tile_into_stack(item, aoi_geojson, dst_transform, H, W, want_scl, required_bands=None):

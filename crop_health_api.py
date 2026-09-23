@@ -98,20 +98,22 @@ def crop_health_score(req: CropHealthRequest):
     if not item:
         raise HTTPException(status_code=404, detail="No suitable item found for crop health scoring")
 
-    first_assets = item.assets or {}
-    first_candidate = utils.prefer_http_from_asset(first_assets.get("red") or first_assets.get("B04"))
-    if not first_candidate:
-        for a in first_assets.values():
-            h = utils.prefer_http_from_asset(a)
-            if h:
-                first_candidate = h
-                break
-    first_red = utils.sign_href_if_pc(first_candidate) if first_candidate else None
-    if not first_red:
-        raise HTTPException(status_code=500, detail="Could not determine reference band URL")
+    target_crs = utils.get_item_crs(item)
+    if target_crs is None:
+        first_assets = item.assets or {}
+        first_candidate = utils.prefer_http_from_asset(first_assets.get("red") or first_assets.get("B04"))
+        if not first_candidate:
+            for a in first_assets.values():
+                h = utils.prefer_http_from_asset(a)
+                if h:
+                    first_candidate = h
+                    break
+        first_red = utils.sign_href_if_pc(first_candidate) if first_candidate else None
+        if not first_red:
+            raise HTTPException(status_code=500, detail="Could not determine reference band URL")
 
-    with rasterio.open(first_red) as fr:
-        target_crs = fr.crs
+        with rasterio.open(first_red) as fr:
+            target_crs = fr.crs
 
     _, dst_transform, H, W, _ = utils.build_adaptive_grid(target_crs, req.geometry, native_res_m=10.0)
 

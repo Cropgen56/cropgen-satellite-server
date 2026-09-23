@@ -56,7 +56,7 @@ Usage
 python cropgen_soil_vra.py
 """
 
-import os, io, base64, math, json, csv, warnings
+import os, io, base64, math, json, csv, time, threading, warnings
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -80,6 +80,12 @@ from rasterio.warp import reproject
 from affine import Affine
 
 from pystac_client import Client
+from rasterio.crs import CRS
+
+try:
+    import planetary_computer
+except ImportError:  # AWS-only deployments
+    planetary_computer = None
 from shapely.geometry import shape, mapping, MultiPolygon
 from shapely.ops import transform as shp_transform
 from pyproj import Transformer
@@ -719,6 +725,11 @@ PLANETARY_URL    = "https://planetarycomputer.microsoft.com/api/stac/v1"
 SEARCH_CLOUD_MAX = 80      # scene-level prefilter; per-pixel SCL does the real work
 TRY_N            = 60
 THREADS          = min(8, (os.cpu_count() or 4))
+SCENE_WORKERS    = 8       # max scenes fetched concurrently (each uses THREADS band reads)
+SCENE_INFLIGHT_MB = 400    # memory budget for scenes being fetched at once
+STACK_CACHE_TTL  = 10 * 60 # VRA and SOC on the same field/window share one stack
+STACK_CACHE_MAX  = 4
+STACK_CACHE_MAX_MB = 256   # larger stacks are not cached
 USE_SHADOW       = True
 
 MAX_SCENES         = 20    # ceiling on scenes stacked per run
@@ -1055,14 +1066,43 @@ def _prefer_https(asset):
     return href if href.startswith("http") else (_s3_to_https(href) if href else None)
 
 
+def _sign(url):
+    """Planetary Computer blobs need a SAS token; other URLs pass through."""
+    if url and planetary_computer is not None and "blob.core.windows.net" in url:
+        try:
+            return planetary_computer.sign(url)
+        except Exception:
+            return url
+    return url
+
+
 def _pick_url(assets, *keys):
     for k in keys:
         a = assets.get(k)
         if a:
             url = _prefer_https(a)
             if url:
-                return url
+                return _sign(url)
     return None
+
+
+def _item_crs(item):
+    """Scene CRS from STAC metadata, so no COG has to be opened just for it."""
+    props = item.properties or {}
+    code = props.get("proj:code") or (f"EPSG:{props['proj:epsg']}" if props.get("proj:epsg") else None)
+    if code:
+        try:
+            return CRS.from_user_input(code)
+        except Exception:
+            pass
+    return None
+
+
+def _tile_id(props):
+    # Planetary: s2:mgrs_tile="43QDA"; Earth Search v1: grid:code="MGRS-43QDA"
+    tile = (props.get("s2:mgrs_tile") or props.get("grid:code")
+            or props.get("sentinel:grid_square") or "")
+    return str(tile).replace("MGRS-", "")
 
 
 def _aoi_scene(aoi_ll, crs_str):
@@ -1092,12 +1132,14 @@ def find_all_scenes(aoi, start, end, max_scenes=MAX_SCENES):
     never compared cloud cover at all.
     """
     seen, scenes = set(), []
-    for cat_url in (EARTH_SEARCH_URL, PLANETARY_URL):
-        for it in _stac_search(cat_url, aoi, start, end, SEARCH_CLOUD_MAX, TRY_N):
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        results = list(ex.map(
+            lambda url: _stac_search(url, aoi, start, end, SEARCH_CLOUD_MAX, TRY_N),
+            (EARTH_SEARCH_URL, PLANETARY_URL)))
+    for found in results:
+        for it in found:
             dt = (it.properties.get("datetime") or "")[:10]
-            tile = (it.properties.get("s2:mgrs_tile")
-                    or it.properties.get("sentinel:grid_square") or "")
-            key = (dt, tile)
+            key = (dt, _tile_id(it.properties))
             if key in seen:
                 continue
             seen.add(key)
@@ -1203,11 +1245,14 @@ def fetch_scene_bands(item, aoi, dst_tf, H, W):
             urls[band] = url
 
     scl_ref = assets.get("scl") or assets.get("SCL")
-    scl_url = _prefer_https(scl_ref) if scl_ref else None
+    scl_url = _sign(_prefer_https(scl_ref)) if scl_ref else None
 
     try:
-        with rasterio.open(urls["B04"]) as ref:
-            geom_sc = _aoi_scene(aoi, ref.crs.to_string())
+        crs = _item_crs(item)
+        if crs is None:
+            with rasterio.open(urls["B04"]) as ref:
+                crs = ref.crs
+        geom_sc = _aoi_scene(aoi, crs.to_string())
 
         def _load(pair):
             band, url = pair
@@ -1218,18 +1263,19 @@ def fetch_scene_bands(item, aoi, dst_tf, H, W):
                 arr /= 10000.0
             return band, arr
 
+        def _load_scl():
+            with rasterio.open(scl_url) as ds:
+                return _read_scl(ds, geom_sc, H, W, dst_tf)
+
         out = {}
-        with ThreadPoolExecutor(max_workers=THREADS) as ex:
+        with ThreadPoolExecutor(max_workers=THREADS + 1) as ex:
+            scl_fut = ex.submit(_load_scl) if scl_url else None
             for f in as_completed([ex.submit(_load, p) for p in urls.items()]):
                 band, arr = f.result()
                 out[band] = arr
+            out["SCL"] = scl_fut.result() if scl_fut else None
         for band in _OPT_BANDS:
             out.setdefault(band, None)
-
-        out["SCL"] = None
-        if scl_url:
-            with rasterio.open(scl_url) as ds:
-                out["SCL"] = _read_scl(ds, geom_sc, H, W, dst_tf)
         return out
     except Exception as exc:
         print(f"      fetch error: {exc}")
@@ -1330,8 +1376,47 @@ def _max_scenes_for_memory(H, W, requested):
     return min(requested, affordable)
 
 
+_STACK_CACHE = {}
+_STACK_CACHE_LOCK = threading.Lock()
+
+
+def _copy_stack_result(res):
+    stack, used, obs, raw_bands = res
+    return ({k: v.copy() for k, v in stack.items()},
+            [dict(u) for u in used],
+            obs.copy(),
+            [{b: a.copy() for b, a in rb.items()} for rb in raw_bands])
+
+
 def build_index_timeseries(scenes, aoi, dst_tf, H, W, aoi_mask,
                             min_clear=MIN_CLEAR_FRACTION):
+    """Cached wrapper around _build_index_timeseries (scene fetch dominates runtime)."""
+    key = json.dumps([[sc["item"].id for sc in scenes], aoi, list(dst_tf)[:6],
+                      H, W, min_clear], sort_keys=True, default=str)
+    now = time.time()
+    with _STACK_CACHE_LOCK:
+        hit = _STACK_CACHE.get(key)
+    if hit and now - hit[0] < STACK_CACHE_TTL:
+        print("      reusing cached scene stack")
+        return _copy_stack_result(hit[1])
+
+    res = _build_index_timeseries(scenes, aoi, dst_tf, H, W, aoi_mask, min_clear)
+    stack, _, obs, raw_bands = res
+    if stack is not None:
+        nbytes = (sum(v.nbytes for v in stack.values()) + obs.nbytes
+                  + sum(a.nbytes for rb in raw_bands for a in rb.values()))
+        if nbytes <= STACK_CACHE_MAX_MB * 1024 ** 2:
+            with _STACK_CACHE_LOCK:
+                for k in [k for k, (t, _) in _STACK_CACHE.items() if now - t >= STACK_CACHE_TTL]:
+                    _STACK_CACHE.pop(k, None)
+                while len(_STACK_CACHE) >= STACK_CACHE_MAX:
+                    _STACK_CACHE.pop(next(iter(_STACK_CACHE)))
+                _STACK_CACHE[key] = (now, _copy_stack_result(res))
+    return res
+
+
+def _build_index_timeseries(scenes, aoi, dst_tf, H, W, aoi_mask,
+                             min_clear=MIN_CLEAR_FRACTION):
     """
     Fetch each scene, mask it with its own SCL, keep the clear-enough ones,
     and return a per-index time series stack.
@@ -1346,8 +1431,23 @@ def build_index_timeseries(scenes, aoi, dst_tf, H, W, aoi_mask,
     scenes = scenes[:cap]
 
     per_scene_idx, used, raw_bands = [], [], []
+    # Fetch scenes concurrently but keep at most SCENE_WORKERS in flight and
+    # consume them in order, so memory stays bounded and output is deterministic.
+    per_scene_mb = H * W * 4 * (len(_CORE_BANDS) + len(_OPT_BANDS) + 1) / (1024 ** 2)
+    workers = max(2, min(SCENE_WORKERS, int(SCENE_INFLIGHT_MB / max(per_scene_mb, 1e-6))))
+    ex = ThreadPoolExecutor(max_workers=workers)
+    pending = {}
+
+    def _fetch(j):
+        return ex.submit(fetch_scene_bands, scenes[j]["item"], aoi, dst_tf, H, W)
+
+    for j in range(min(workers, len(scenes))):
+        pending[j] = _fetch(j)
     for i, sc in enumerate(scenes, 1):
-        bands = fetch_scene_bands(sc["item"], aoi, dst_tf, H, W)
+        bands = pending.pop(i - 1).result()
+        nxt = i - 1 + workers
+        if nxt < len(scenes):
+            pending[nxt] = _fetch(nxt)
         if bands is None:
             print(f"    [{i:2d}/{len(scenes)}] {sc['date']}  fetch failed — skipped")
             continue
@@ -1367,6 +1467,7 @@ def build_index_timeseries(scenes, aoi, dst_tf, H, W, aoi_mask,
         used.append({"date": sc["date"], "scene_cloud_pct": round(sc["cloud"], 2),
                       "clear_fraction": round(frac, 4)})
         print(f"    [{i:2d}/{len(scenes)}] {sc['date']}  clear={frac*100:5.1f}%  accepted")
+    ex.shutdown(wait=True)
 
     if not per_scene_idx:
         return None, [], None, []
@@ -2432,13 +2533,15 @@ def run_analysis(aoi_geojson, start_date, end_date, crop="wheat",
                   zone_features=None, district=None, state=None,
                   auto_region=True, use_soilgrids=False,
                   grid_cell_m=DEFAULT_CELL_M, soc_method="published",
-                  include_images=True):
+                  include_images=True, image_keys=None):
     """
     Full time-series soil + VRA analysis.
 
     ground_samples: optional list of lab results, e.g.
         [{"lat":20.1372,"lon":77.1561,"SOC":0.82,"N":210,"P":24,"K":180}, ...]
       Supply 8-12 well-spread points to switch parameters to CALIBRATED.
+    image_keys: optional subset of image names to render (e.g. {"SOC"});
+      None renders every map. Rendering is a large share of the runtime.
     """
     _validate_inputs(aoi_geojson, start_date, end_date, crop, n_zones)
     print(f"\n{'='*70}\n  CROPGEN SOIL + VRA ENGINE v6 (time-series)"
@@ -2454,11 +2557,13 @@ def run_analysis(aoi_geojson, start_date, end_date, crop="wheat",
 
     # 2 ── grid
     print("[2/9] Building native 10 m grid ...")
-    red_url = _pick_url(scenes[0]["item"].assets, "red", "B04")
-    if not red_url:
-        raise RuntimeError("No red-band asset — cannot derive CRS.")
-    with rasterio.open(red_url) as ref:
-        crs = ref.crs
+    crs = _item_crs(scenes[0]["item"])
+    if crs is None:
+        red_url = _pick_url(scenes[0]["item"].assets, "red", "B04")
+        if not red_url:
+            raise RuntimeError("No red-band asset — cannot derive CRS.")
+        with rasterio.open(red_url) as ref:
+            crs = ref.crs
     aoi_sc, dst_tf, H, W, res_m = build_grid(crs, aoi_geojson, NATIVE_RES_M)
     aoi_mask = geometry_mask([mapping(aoi_sc)], out_shape=(H, W),
                              transform=dst_tf, invert=True)
@@ -2620,7 +2725,12 @@ def run_analysis(aoi_geojson, start_date, end_date, crop="wheat",
     images = {}
     if include_images:
         print("[9/9] Rendering ...")
+        def want(name):
+            return image_keys is None or name in image_keys
+
         for key in params:
+            if not want(key):
+                continue
             status = calib.get(key, {}).get("status", CALIB_UNCAL)
             images[key] = render_parameter_map(
                 params[key], zres_by[key]["zone_grid"], aoi_sc, dst_tf, res_m,
@@ -2629,16 +2739,20 @@ def run_analysis(aoi_geojson, start_date, end_date, crop="wheat",
                 calib_status=status)
             print(f"      - {PARAMETERS[key]['label']}")
 
-        images["MANAGEMENT_ZONES"] = render_parameter_map(
-            params.get("VIGOUR", params["SOC"]), mv_zres["zone_grid"], aoi_sc, dst_tf,
-            res_m, "VIGOUR", capture_info + "  |  multivariate zones",
-            zone_labels=mv_zres["zone_labels"], label_mode="percent",
-            calib_status=calib.get("VIGOUR", {}).get("status", CALIB_UNCAL))
-        images["CORRELATION"] = render_correlation_matrix(corr_names, corr_C)
-        images["TIMESERIES"] = render_timeseries_chart(used, scene_ndvi, bare_idx, veg_idx, thr)
-        images["OVERVIEW"] = render_overview(
-            params, zres_by, aoi_sc, dst_tf, res_m, capture_info,
-            [k for k in ["SOC", "N", "P", "K", "MOISTURE", "CLAY"] if k in params])
+        if want("MANAGEMENT_ZONES"):
+            images["MANAGEMENT_ZONES"] = render_parameter_map(
+                params.get("VIGOUR", params["SOC"]), mv_zres["zone_grid"], aoi_sc, dst_tf,
+                res_m, "VIGOUR", capture_info + "  |  multivariate zones",
+                zone_labels=mv_zres["zone_labels"], label_mode="percent",
+                calib_status=calib.get("VIGOUR", {}).get("status", CALIB_UNCAL))
+        if want("CORRELATION"):
+            images["CORRELATION"] = render_correlation_matrix(corr_names, corr_C)
+        if want("TIMESERIES"):
+            images["TIMESERIES"] = render_timeseries_chart(used, scene_ndvi, bare_idx, veg_idx, thr)
+        if want("OVERVIEW"):
+            images["OVERVIEW"] = render_overview(
+                params, zres_by, aoi_sc, dst_tf, res_m, capture_info,
+                [k for k in ["SOC", "N", "P", "K", "MOISTURE", "CLAY"] if k in params])
         print("      - management zones, correlation, time series, overview")
     else:
         print("[9/9] Skipping map render (include_images=False)")

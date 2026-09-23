@@ -84,7 +84,7 @@ def _soc_stats(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
-def run_vra(req) -> Dict[str, Any]:
+def run_vra(req, image_keys=None) -> Dict[str, Any]:
     samples = None
     if req.ground_samples:
         samples = [_dump(s) for s in req.ground_samples]
@@ -108,6 +108,8 @@ def run_vra(req) -> Dict[str, Any]:
     )
     if req.max_scenes is not None:
         kwargs["max_scenes"] = req.max_scenes
+    if image_keys is not None:
+        kwargs["image_keys"] = image_keys
     if getattr(req, "zone_features", None):
         kwargs["zone_features"] = req.zone_features
 

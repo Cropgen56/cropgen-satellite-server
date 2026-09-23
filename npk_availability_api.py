@@ -1,5 +1,8 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from fastapi import APIRouter, HTTPException
+
+import utils
 
 from calculate_index_api import calculate_index
 from models import (
@@ -86,15 +89,22 @@ def npk_availability(req: NpkAvailabilityRequest):
         raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
 
     try:
-        n_score = _index_health(
-            req.geometry, req.date, "NITROGEN", req.provider, req.satellite
+        # Warm the shared STAC search + scene scoring caches once so the three
+        # parallel index runs below reuse them instead of repeating the work.
+        search_order = utils.get_provider_search_order(req.provider, prefer_pc_default=True)
+        utils.pick_best_item(
+            req.geometry,
+            req.date,
+            req.date,
+            prefer_pc=search_order[0] == "planetary",
+            satellite=(req.satellite or "s2").lower(),
         )
-        p_score = _index_health(
-            req.geometry, req.date, "CCC", req.provider, req.satellite
-        )
-        k_score = _index_health(
-            req.geometry, req.date, "NDMI", req.provider, req.satellite
-        )
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            n_fut, p_fut, k_fut = (
+                ex.submit(_index_health, req.geometry, req.date, name, req.provider, req.satellite)
+                for name in ("NITROGEN", "CCC", "NDMI")
+            )
+            n_score, p_score, k_score = n_fut.result(), p_fut.result(), k_fut.result()
     except HTTPException:
         raise
     except Exception as exc:
