@@ -15,3 +15,6 @@ ENV/
 
 # Logs
 *.log
+
+# Secrets
+.env
