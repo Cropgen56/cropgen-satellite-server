@@ -3,6 +3,9 @@ import os
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+
+load_dotenv(override=True)  # override=True ensures .env always wins over shell/conda env vars
+
 from availability_dates_api import router as availability_router
 from calculate_index_api import router as calculate_router
 from npk_availability_api import router as npk_router
@@ -11,9 +14,8 @@ from timeseries_water_api import router as water_router
 from crop_health_api import router as crop_health_router
 from soc_api import router as soc_router
 from vra_api import router as vra_router
+from terrain_api import router as terrain_router
 from auth import get_expected_api_key, validate_api_key
-
-load_dotenv(override=True)  # override=True ensures .env always wins over shell/conda env vars
 
 # Docs + OpenAPI must live under /v4/ so the browser requests /v4/openapi.json (same prefix as
 # /v4/docs). Default /openapi.json hits the site root and is often routed to the wrong upstream
@@ -129,6 +131,13 @@ app.include_router(
     vra_router,
     prefix="/v4/api/soil-vra",
     tags=["VRA"],
+    dependencies=[Depends(validate_api_key)],
+)
+
+app.include_router(
+    terrain_router,
+    prefix="/v4/api/terrain",
+    tags=["Terrain"],
     dependencies=[Depends(validate_api_key)],
 )
 

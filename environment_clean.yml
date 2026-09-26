@@ -16,9 +16,13 @@ dependencies:
   - pillow
   - matplotlib
   - python-dateutil
+  - affine
+  - pydantic>=2.5
   - pip:
     - fastapi
     - "uvicorn[standard]"
     - pystac-client
     - planetary-computer
     - python-dotenv
+    - pytest
+    - httpx
