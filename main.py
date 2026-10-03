@@ -15,6 +15,8 @@ from app.routers.crop_health_api import router as crop_health_router
 from app.routers.soc_api import router as soc_router
 from app.routers.vra_api import router as vra_router
 from app.routers.terrain_api import router as terrain_router
+from app.routers.multi_availability_api import router as multi_availability_router
+from app.routers.multi_calculate_index_api import router as multi_calculate_router
 from app.auth import get_expected_api_key, validate_api_key
 
 # Docs + OpenAPI must live under /v4/ so the browser requests /v4/openapi.json (same prefix as
@@ -80,6 +82,20 @@ app.include_router(
     calculate_router,
     prefix="/v4/api/calculate",
     tags=["Calculate Index"],
+    dependencies=[Depends(validate_api_key)],
+)
+
+app.include_router(
+    multi_availability_router,
+    prefix="/v4/api/multi/availability",
+    tags=["Multi-Polygon Availability"],
+    dependencies=[Depends(validate_api_key)],
+)
+
+app.include_router(
+    multi_calculate_router,
+    prefix="/v4/api/multi/calculate",
+    tags=["Multi-Polygon Calculate Index"],
     dependencies=[Depends(validate_api_key)],
 )
 

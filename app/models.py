@@ -41,6 +41,59 @@ class CalculateResponse(BaseModel):
     area_stats: Optional[List[AreaStat]] = None
 
 
+# ---- Multi-polygon (GeoJSON FeatureCollection) variants ----
+
+class MultiAvailabilityRequest(BaseModel):
+    geojson: Dict[str, Any] = Field(..., description="GeoJSON FeatureCollection of Polygon/MultiPolygon fields")
+    start_date: str
+    end_date: str
+    provider: Optional[str] = "both"
+    satellite: Optional[str] = "s2"
+
+class MultiAvailabilityItem(BaseModel):
+    date: str
+    cloud_cover: Optional[float] = None
+    feature_count: int
+    feature_ids: List[str]
+
+class MultiAvailabilityResponse(BaseModel):
+    total_features: int
+    items: List[MultiAvailabilityItem]
+
+class MultiCalculateRequest(BaseModel):
+    geojson: Dict[str, Any] = Field(..., description="GeoJSON FeatureCollection of Polygon/MultiPolygon fields")
+    date: str
+    index_name: str
+    provider: Optional[str] = "both"
+    satellite: Optional[str] = "s2"
+    width: Optional[int] = 800
+    height: Optional[int] = 800
+    supersample: Optional[int] = 1
+    smooth: Optional[bool] = False
+    gaussian_sigma: Optional[float] = 1.0
+
+class MultiCalculateResult(BaseModel):
+    id: str
+    properties: Dict[str, Any] = {}
+    image_base64: str
+    bounds: Optional[List[float]] = None
+    legend: Optional[List[Dict[str, Any]]] = None
+
+class MultiCalculateError(BaseModel):
+    id: str
+    status_code: int
+    detail: str
+
+class MultiCalculateResponse(BaseModel):
+    date: str
+    index_name: str
+    total_features: int
+    succeeded: int
+    failed: int
+    results: List[MultiCalculateResult]
+    errors: List[MultiCalculateError]
+
+
 class NpkAvailabilityRequest(BaseModel):
     geometry: Dict[str, Any]
     date: str
