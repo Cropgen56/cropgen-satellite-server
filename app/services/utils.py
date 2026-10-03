@@ -150,6 +150,12 @@ def get_provider_search_order(provider: Optional[str], prefer_pc_default: bool =
 STAC_METADATA_FIELDS = {
     "exclude": ["assets", "links"],
 }
+# Earth Search (AWS) is the opposite: with exclude-only it returns just
+# `properties.datetime`, losing eo:cloud_cover, so properties must be included.
+AWS_STAC_METADATA_FIELDS = {
+    "include": ["id", "type", "geometry", "bbox", "collection", "properties"],
+    "exclude": ["assets", "links"],
+}
 
 
 # Search results are shared across endpoints (availability, timeseries and
@@ -890,6 +896,8 @@ def search_planetary(collections, intersects, dt, limit=50, metadata_only: bool 
 
 def search_aws(collections, intersects, dt, limit=50, metadata_only: bool = False):
     search_kwargs = _stac_search_kwargs(collections, intersects, dt, limit, metadata_only)
+    if metadata_only:
+        search_kwargs["fields"] = AWS_STAC_METADATA_FIELDS
     try:
         cat = get_aws_client()
         items = list(cat.search(**search_kwargs).items())

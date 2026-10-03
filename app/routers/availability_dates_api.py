@@ -1,16 +1,16 @@
 from fastapi import APIRouter, HTTPException
 from app.models import AvailabilityRequest, AvailabilityResponse, AvailabilityItem
 from app.services import utils
+from app.services.response_cache import TTLCache
 import json
-import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 router = APIRouter()
 
 AVAILABILITY_SEARCH_LIMIT = 500
 RESPONSE_CACHE_TTL_SECONDS = 10 * 60
-_RESPONSE_CACHE: Dict[str, tuple[float, Dict[str, Any]]] = {}
+_RESPONSE_CACHE = TTLCache(ttl_seconds=RESPONSE_CACHE_TTL_SECONDS, max_entries=1024)
 
 
 def _request_cache_key(req: AvailabilityRequest) -> str:
@@ -24,22 +24,6 @@ def _request_cache_key(req: AvailabilityRequest) -> str:
         },
         sort_keys=True,
     )
-
-
-def _get_cached_response(cache_key: str) -> Optional[Dict[str, Any]]:
-    cached = _RESPONSE_CACHE.get(cache_key)
-    if not cached:
-        return None
-    timestamp, value = cached
-    if time.time() - timestamp > RESPONSE_CACHE_TTL_SECONDS:
-        _RESPONSE_CACHE.pop(cache_key, None)
-        return None
-    return value
-
-
-def _set_cached_response(cache_key: str, value: Dict[str, Any]) -> Dict[str, Any]:
-    _RESPONSE_CACHE[cache_key] = (time.time(), value)
-    return value
 
 
 def _aggregate_availability_items(all_items: List[Any]) -> List[AvailabilityItem]:
@@ -74,7 +58,7 @@ def availability(req: AvailabilityRequest):
         raise HTTPException(status_code=400, detail="start_date and end_date must be YYYY-MM-DD")
 
     cache_key = _request_cache_key(req)
-    cached = _get_cached_response(cache_key)
+    cached = _RESPONSE_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
@@ -98,6 +82,6 @@ def availability(req: AvailabilityRequest):
             return {"items": []}
 
         out_items = _aggregate_availability_items(all_items)
-        return _set_cached_response(cache_key, {"items": out_items})
+        return _RESPONSE_CACHE.set(cache_key, {"items": out_items})
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

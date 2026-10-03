@@ -1,13 +1,13 @@
 from fastapi import APIRouter, HTTPException
 from app.models import CalculateRequest, CalculateResponse
 from app.services import utils
+from app.services.response_cache import TTLCache
 import numpy as np
 import time
 import json
 from datetime import datetime, timedelta
 import io
 import base64
-from typing import Any, Dict, Optional
 
 # rasterio + helpers (needed here because we call rasterio.open, Resampling, etc.)
 import rasterio
@@ -24,7 +24,7 @@ from PIL import Image
 router = APIRouter()
 
 RESPONSE_CACHE_TTL_SECONDS = 10 * 60
-_RESPONSE_CACHE: Dict[str, tuple[float, Dict[str, Any]]] = {}
+_RESPONSE_CACHE = TTLCache(ttl_seconds=RESPONSE_CACHE_TTL_SECONDS, max_entries=256)
 
 
 def _request_cache_key(req: CalculateRequest, index_name: str) -> str:
@@ -44,21 +44,6 @@ def _request_cache_key(req: CalculateRequest, index_name: str) -> str:
         sort_keys=True,
     )
 
-
-def _get_cached_response(cache_key: str) -> Optional[Dict[str, Any]]:
-    cached = _RESPONSE_CACHE.get(cache_key)
-    if not cached:
-        return None
-    timestamp, value = cached
-    if time.time() - timestamp > RESPONSE_CACHE_TTL_SECONDS:
-        _RESPONSE_CACHE.pop(cache_key, None)
-        return None
-    return value
-
-
-def _set_cached_response(cache_key: str, value: Dict[str, Any]) -> Dict[str, Any]:
-    _RESPONSE_CACHE[cache_key] = (time.time(), value)
-    return value
 
 @router.post("/index", response_model=CalculateResponse)
 def calculate_index(req: CalculateRequest):
@@ -140,7 +125,7 @@ def calculate_index(req: CalculateRequest):
     required_bands = index_band_map[index_name]
 
     cache_key = _request_cache_key(req, index_name)
-    cached = _get_cached_response(cache_key)
+    cached = _RESPONSE_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
@@ -382,7 +367,7 @@ def calculate_index(req: CalculateRequest):
 
             bounds = utils.compute_bounds_wgs84(dst_transform, W, H, target_crs)
             merged_legend = [{"color": "#000000", "label": "True Color", "hectares": 0.0, "percent": 0.0}]
-            return _set_cached_response(cache_key, {
+            return _RESPONSE_CACHE.set(cache_key, {
                 "date": date_str,
                 "index_name": index_name,
                 "image_base64": img_b64,
@@ -453,7 +438,7 @@ def calculate_index(req: CalculateRequest):
                 "percent": am.get("percent", 0.0)
             })
 
-        return _set_cached_response(cache_key, {
+        return _RESPONSE_CACHE.set(cache_key, {
             "date": date_str,
             "index_name": index_name,
             "image_base64": img_b64,

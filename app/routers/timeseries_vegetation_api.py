@@ -5,7 +5,6 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import traceback
 import json
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # helpers from utils.py
@@ -19,6 +18,7 @@ from app.services.utils import (
     read_bands_window_parallel,
     resolve_asset,
 )
+from app.services.response_cache import TTLCache
 
 router = APIRouter()
 
@@ -31,7 +31,7 @@ MAX_RETURN_POINTS = 16
 MAX_SEARCH_ITEMS = 24
 RESPONSE_CACHE_TTL_SECONDS = 10 * 60
 MAX_CLOUD_PCT = 60.0
-_RESPONSE_CACHE: Dict[str, tuple[float, Dict[str, Any]]] = {}
+_RESPONSE_CACHE = TTLCache(ttl_seconds=RESPONSE_CACHE_TTL_SECONDS, max_entries=1024)
 
 class TSRequest(BaseModel):
     geometry: Dict[str, Any]
@@ -79,22 +79,6 @@ def _request_cache_key(req: TSRequest, idx: str) -> str:
         },
         sort_keys=True,
     )
-
-
-def _get_cached_response(cache_key: str) -> Optional[Dict[str, Any]]:
-    cached = _RESPONSE_CACHE.get(cache_key)
-    if not cached:
-        return None
-    timestamp, value = cached
-    if time.time() - timestamp > RESPONSE_CACHE_TTL_SECONDS:
-        _RESPONSE_CACHE.pop(cache_key, None)
-        return None
-    return value
-
-
-def _set_cached_response(cache_key: str, value: Dict[str, Any]) -> Dict[str, Any]:
-    _RESPONSE_CACHE[cache_key] = (time.time(), value)
-    return value
 
 
 def _item_date(item) -> str:
@@ -237,7 +221,7 @@ def vegetation_timeseries(req: TSRequest):
     try:
         max_points = _normalize_max_points(req.max_items)
         cache_key = _request_cache_key(req, idx)
-        cached = _get_cached_response(cache_key)
+        cached = _RESPONSE_CACHE.get(cache_key)
         if cached is not None:
             return cached
 
@@ -251,7 +235,7 @@ def vegetation_timeseries(req: TSRequest):
         )
 
         if not items:
-            return _set_cached_response(
+            return _RESPONSE_CACHE.set(
                 cache_key,
                 {"index": idx, "summary": {"min": None, "mean": None, "max": None}, "timeseries": []},
             )
@@ -273,7 +257,7 @@ def vegetation_timeseries(req: TSRequest):
                     results.append(res)
 
         if not results:
-            return _set_cached_response(
+            return _RESPONSE_CACHE.set(
                 cache_key,
                 {"index": idx, "summary": {"min": None, "mean": None, "max": None}, "timeseries": []},
             )
@@ -304,7 +288,7 @@ def vegetation_timeseries(req: TSRequest):
             "mean": round(float(sum(vals) / len(vals)), 3),
             "max": round(max(vals), 3)
         }
-        return _set_cached_response(
+        return _RESPONSE_CACHE.set(
             cache_key,
             {"index": idx, "summary": summary, "timeseries": times},
         )
