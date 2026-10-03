@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
-from models import AvailabilityRequest, AvailabilityResponse, AvailabilityItem
-import utils
+from app.models import AvailabilityRequest, AvailabilityResponse, AvailabilityItem
+from app.services import utils
 import json
 import time
 from datetime import datetime

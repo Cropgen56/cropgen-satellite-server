@@ -18,3 +18,6 @@ ENV/
 
 # Secrets
 .env
+
+# macOS
+.DS_Store

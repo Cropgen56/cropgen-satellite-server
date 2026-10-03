@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
-from models import CalculateRequest, CalculateResponse
-import utils
+from app.models import CalculateRequest, CalculateResponse
+from app.services import utils
 import numpy as np
 import time
 import json

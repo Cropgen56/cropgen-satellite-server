@@ -7,7 +7,7 @@ the Zoning UI already consumes (date, cloud_cover, soc_stats).
 
 from typing import Any, Dict, Optional
 
-import cropgen_soil_vra
+from app.services import cropgen_soil_vra
 
 HA_ACRE = 2.47105
 

@@ -1,8 +1,8 @@
 from fastapi import APIRouter, HTTPException
 
-import cropgen_soil_vra
-from models import VraAnalysisRequest, VraAnalysisResponse
-from vra_service import run_vra
+from app.services import cropgen_soil_vra
+from app.models import VraAnalysisRequest, VraAnalysisResponse
+from app.services.vra_service import run_vra
 
 router = APIRouter()
 

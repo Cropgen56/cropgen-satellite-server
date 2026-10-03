@@ -1,4 +1,4 @@
-# timeseries_vegetation_api.py
+# timeseries_water_api.py
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Any, Dict, List, Optional
@@ -8,8 +8,8 @@ import json
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# helpers from utils.py
-from utils import (
+# utils helpers
+from app.services.utils import (
     compute_index_array_by_name,
     search_stac_items,
     THREADS,
@@ -21,16 +21,14 @@ from utils import (
 )
 
 router = APIRouter()
-
-# ✅ Only keep the required vegetation indices
-SUPPORTED = ["NDVI", "EVI", "SAVI", "SUCROSE"]
+VALID = ["NDMI", "NDWI", "SMI", "MSI", "WI", "NMDI"]
 MAX_THREADS = THREADS
 SAMPLE_SIZE = 8
 DEFAULT_MAX_POINTS = 8
 MAX_RETURN_POINTS = 16
 MAX_SEARCH_ITEMS = 24
 RESPONSE_CACHE_TTL_SECONDS = 10 * 60
-MAX_CLOUD_PCT = 60.0
+MAX_CLOUD_PCT = 80.0
 _RESPONSE_CACHE: Dict[str, tuple[float, Dict[str, Any]]] = {}
 
 class TSRequest(BaseModel):
@@ -133,19 +131,25 @@ def _pick_best_items(items: List[Any], max_points: int) -> List[Any]:
     ]
     return [deduped[i] for i in idxs]
 
-def classify_vegetation(index: str, v: Optional[float]) -> str:
+def classify_water(index: str, v: Optional[float]) -> str:
     if v is None:
         return "No Data"
-    if index in ("NDVI", "EVI", "SAVI"):
-        if v < 0.2: return "Very Poor"
-        if v < 0.4: return "Moderate"
-        if v < 0.6: return "Good"
-        return "Very Good"
-    if index == "SUCROSE":
-        if v < 0.2: return "Immature"
-        if v < 0.4: return "Early Maturity"
-        if v < 0.6: return "Optimal"
-        return "Overmature"
+    if index in ("NDMI", "NDWI", "SMI", "NMDI"):
+        if v < 0.1: return "Very Low"
+        if v < 0.2: return "Low"
+        if v < 0.3: return "Moderate"
+        if v < 0.4: return "High"
+        return "Very High"
+    if index == "MSI":
+        if v < 0.3: return "Very Wet"
+        if v < 0.5: return "Wet"
+        if v < 0.7: return "Moderate"
+        if v < 1.0: return "Dry"
+        return "Very Dry"
+    if index == "WI":
+        if v < 1.0: return "Dry"
+        if v < 1.5: return "Moderate"
+        return "Wet"
     return "Unknown"
 
 def _signed_asset_map(item, needed):
@@ -161,7 +165,7 @@ def _read_bands_from_signed(signed_assets, needed, geom, out_h=16, out_w=16):
         band_urls, geom, out_h, out_w, scale_reflectance=True
     )
 
-def _compute_index_for_item(item, geom, idx, out_h=SAMPLE_SIZE, out_w=SAMPLE_SIZE):
+def _compute_water_for_item(item, geom, idx, out_h=SAMPLE_SIZE, out_w=SAMPLE_SIZE):
     try:
         cloud = item.properties.get("eo:cloud_cover") or item.properties.get("cloud_cover")
         if cloud is not None:
@@ -171,17 +175,21 @@ def _compute_index_for_item(item, geom, idx, out_h=SAMPLE_SIZE, out_w=SAMPLE_SIZ
             except Exception:
                 pass
 
-        # ✅ Only needed bands for the 4 indices
-        if idx == "NDVI":
+        if idx == "NDMI":
+            needed = ["B08","B11"]
+        elif idx == "NDWI":
+            # NDWI (McFeeters) = (Green - NIR) / (Green + NIR)
+            needed = ["B03","B08"]
+        elif idx == "SMI":
             needed = ["B08","B04"]
-        elif idx == "EVI":
-            needed = ["B08","B04","B02"]
-        elif idx == "SAVI":
-            needed = ["B08","B04"]
-        elif idx == "SUCROSE":
-            needed = ["B11","B04"]
+        elif idx == "MSI":
+            needed = ["B11","B08"]
+        elif idx == "WI":
+            needed = ["B08","B11"]
+        elif idx == "NMDI":
+            needed = ["B11","B12","B08"]
         else:
-            return None
+            needed = []
 
         reqset = set(b.lower() for b in needed)
         if not _item_has_required_assets(item, reqset):
@@ -192,25 +200,22 @@ def _compute_index_for_item(item, geom, idx, out_h=SAMPLE_SIZE, out_w=SAMPLE_SIZ
         if any(bands.get(b) is None for b in needed):
             return None
 
-        band_dict = {k: bands.get(k) for k in bands}
-
-        try:
-            arr = compute_index_array_by_name(idx, band_dict)
-        except Exception:
-            eps = 1e-6
-            if idx == "NDVI":
-                arr = (band_dict["B08"] - band_dict["B04"]) / (band_dict["B08"] + band_dict["B04"] + eps)
-            elif idx == "EVI":
-                NIR, RED, BLUE = band_dict["B08"], band_dict["B04"], band_dict["B02"]
-                arr = 2.5 * (NIR - RED) / (NIR + 6*RED - 7.5*BLUE + 1.0 + eps)
-            elif idx == "SAVI":
-                NIR, RED = band_dict["B08"], band_dict["B04"]
-                L = 0.5
-                arr = ((NIR - RED) / (NIR + RED + L + eps)) * (1.0 + L)
-            elif idx == "SUCROSE":
-                arr = (band_dict["B11"] - band_dict["B04"]) / (band_dict["B11"] + band_dict["B04"] + eps)
-            else:
-                return None
+        if idx == "NDMI":
+            arr = (bands["B08"] - bands["B11"]) / (bands["B08"] + bands["B11"] + 1e-6)
+        elif idx == "NDWI":
+            arr = (bands["B03"] - bands["B08"]) / (bands["B03"] + bands["B08"] + 1e-6)
+        elif idx == "SMI":
+            ndvi = (bands["B08"] - bands["B04"]) / (bands["B08"] + bands["B04"] + 1e-6)
+            arr = ndvi * 0.3 + 0.1
+        elif idx == "MSI":
+            arr = bands["B11"] / (bands["B08"] + 1e-6)
+        elif idx == "WI":
+            arr = bands["B08"] / (bands["B11"] + 1e-6)
+        elif idx == "NMDI":
+            swir_sum = bands["B11"] + bands["B12"]
+            arr = (bands["B08"] - swir_sum) / (bands["B08"] + swir_sum + 1e-6)
+        else:
+            return None
 
         mask = np.isfinite(arr)
         if not np.any(mask):
@@ -221,18 +226,16 @@ def _compute_index_for_item(item, geom, idx, out_h=SAMPLE_SIZE, out_w=SAMPLE_SIZ
     except Exception:
         return None
 
-@router.post("/vegetation", response_model=TSResponse)
-def vegetation_timeseries(req: TSRequest):
+@router.post("/water", response_model=TSResponse)
+def water_timeseries(req: TSRequest):
     idx = req.index.upper()
-    if idx not in SUPPORTED:
-        raise HTTPException(status_code=400, detail=f"Unsupported index. Supported: {SUPPORTED}")
+    if idx not in VALID:
+        raise HTTPException(status_code=400, detail=f"Unsupported index. Supported: {VALID}")
 
+    # disallow S1 for optical water indices
     satellite = (req.satellite or "s2").lower()
     if satellite.startswith("s1"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Index {idx} requires Sentinel-2 (optical). Sentinel-1 is radar-only."
-        )
+        raise HTTPException(status_code=400, detail=f"Index {idx} requires Sentinel-2 (optical). Sentinel-1 is radar-only.")
 
     try:
         max_points = _normalize_max_points(req.max_items)
@@ -261,7 +264,7 @@ def vegetation_timeseries(req: TSRequest):
         results = []
         with ThreadPoolExecutor(max_workers=min(MAX_THREADS, max(1, len(items)))) as ex:
             futures = {
-                ex.submit(_compute_index_for_item, it, req.geometry, idx, SAMPLE_SIZE, SAMPLE_SIZE): it
+                ex.submit(_compute_water_for_item, it, req.geometry, idx, SAMPLE_SIZE, SAMPLE_SIZE): it
                 for it in items
             }
             for fut in as_completed(futures):
@@ -278,6 +281,7 @@ def vegetation_timeseries(req: TSRequest):
                 {"index": idx, "summary": {"min": None, "mean": None, "max": None}, "timeseries": []},
             )
 
+        # Aggregate by date
         date_map: Dict[str, List[float]] = {}
         for date_str, val in results:
             if not date_str:
@@ -287,6 +291,7 @@ def vegetation_timeseries(req: TSRequest):
         aggregated = [(d, round(float(sum(vals) / len(vals)), 3)) for d, vals in date_map.items()]
         aggregated_sorted = sorted(aggregated, key=lambda x: x[0])
 
+        # downsample evenly if requested fewer points
         max_pts = max_points or len(aggregated_sorted)
         if len(aggregated_sorted) > max_pts:
             n = max_pts
@@ -296,14 +301,10 @@ def vegetation_timeseries(req: TSRequest):
         times = []
         vals = []
         for d, v in aggregated_sorted:
-            times.append({"date": d, "value": v, "status": classify_vegetation(idx, v)})
+            times.append({"date": d, "value": v, "status": classify_water(idx, v)})
             vals.append(v)
 
-        summary = {
-            "min": round(min(vals), 3),
-            "mean": round(float(sum(vals) / len(vals)), 3),
-            "max": round(max(vals), 3)
-        }
+        summary = {"min": round(min(vals),3), "mean": round(float(sum(vals)/len(vals)),3), "max": round(max(vals),3)}
         return _set_cached_response(
             cache_key,
             {"index": idx, "summary": summary, "timeseries": times},

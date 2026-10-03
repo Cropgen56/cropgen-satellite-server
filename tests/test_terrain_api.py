@@ -21,8 +21,8 @@ from fastapi.testclient import TestClient  # noqa: E402
 from PIL import Image  # noqa: E402
 
 import main  # noqa: E402
-import terrain_api as M  # noqa: E402
-from terrain import engine as E  # noqa: E402
+from app.routers import terrain_api as M  # noqa: E402
+from app.terrain import engine as E  # noqa: E402
 
 KEY = {"x-api-key": os.environ["CROPGEN_API_KEY"]}
 URL = "/v4/api/terrain"

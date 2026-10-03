@@ -23,10 +23,10 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
-from terrain import engine as E
-from terrain import render as R
-from terrain.cache import SingleFlightCache
-from terrain.settings import load_settings
+from app.terrain import engine as E
+from app.terrain import render as R
+from app.terrain.cache import SingleFlightCache
+from app.terrain.settings import load_settings
 
 log = logging.getLogger("terrain.api")
 

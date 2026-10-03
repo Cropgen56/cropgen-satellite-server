@@ -2,10 +2,10 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from fastapi import APIRouter, HTTPException
 
-import utils
+from app.services import utils
 
-from calculate_index_api import calculate_index
-from models import (
+from app.routers.calculate_index_api import calculate_index
+from app.models import (
     CalculateRequest,
     NpkAvailabilityRequest,
     NpkAvailabilityResponse,

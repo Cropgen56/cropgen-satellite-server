@@ -4,7 +4,7 @@ Elevation, slope, aspect, water flow, water accumulation, wetness and erosion
 risk for any field, as AOI-clipped PNG overlays with legends.
 
 Mounted in `main.py` under `/v4/api/terrain`, behind the server's shared
-`x-api-key` (`CROPGEN_API_KEY`). Router: `terrain_api.py`; engine: this package.
+`x-api-key` (`CROPGEN_API_KEY`). Router: `app/routers/terrain_api.py`; engine: this package.
 
 Tests (offline, no network): `pytest -q tests/test_terrain_api.py`
 
@@ -95,7 +95,7 @@ it to Redis if that starts to matter.
 
 ## Thresholds to calibrate
 
-These are fixed physical thresholds in `terrain/engine.py`, deliberately not
+These are fixed physical thresholds in `app/terrain/engine.py`, deliberately not
 percentiles of each field — percentile classes painted "High erosion" on 18 % of
 every field regardless of terrain. They are sensible starting points, not
 calibrated values. Check them against fields your agronomists know.

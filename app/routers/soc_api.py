@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException
 
-from models import SocAnalysisRequest, SocAnalysisResponse, VraAnalysisRequest
-from vra_service import run_vra
+from app.models import SocAnalysisRequest, SocAnalysisResponse, VraAnalysisRequest
+from app.services.vra_service import run_vra
 
 router = APIRouter()
 

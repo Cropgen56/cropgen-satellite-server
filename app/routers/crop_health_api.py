@@ -7,8 +7,8 @@ from fastapi import APIRouter, HTTPException
 from rasterio.features import geometry_mask
 from shapely.geometry import mapping
 
-import utils
-from models import CropHealthRequest, CropHealthResponse
+from app.services import utils
+from app.models import CropHealthRequest, CropHealthResponse
 
 router = APIRouter()
 
