@@ -51,6 +51,7 @@ default_origins = [
     "https://app.cropgenapp.com",
     "https://admin.cropgenapp.com",
     "https://biodrops.cropgenapp.com",
+    "https://monitor.cropgenapp.com",
     "https://satagro.ai",
     "https://app.satagro.ai",
 ]
