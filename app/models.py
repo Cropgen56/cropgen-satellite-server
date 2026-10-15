@@ -39,6 +39,8 @@ class CalculateResponse(BaseModel):
     bounds: Optional[List[float]] = None
     legend: Optional[List[Dict[str, Any]]] = None
     area_stats: Optional[List[AreaStat]] = None
+    # Index value summary over the field's valid pixels: mean, median, min, max, p10, p90, valid_pct
+    stats: Optional[Dict[str, float]] = None
 
 
 # ---- Multi-polygon (GeoJSON FeatureCollection) variants ----
@@ -78,6 +80,7 @@ class MultiCalculateResult(BaseModel):
     image_base64: str
     bounds: Optional[List[float]] = None
     legend: Optional[List[Dict[str, Any]]] = None
+    stats: Optional[Dict[str, float]] = None
 
 class MultiCalculateError(BaseModel):
     id: str

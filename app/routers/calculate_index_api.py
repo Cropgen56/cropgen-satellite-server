@@ -45,6 +45,162 @@ def _request_cache_key(req: CalculateRequest, index_name: str) -> str:
     )
 
 
+INDEX_BAND_MAP = {
+    'NDVI': ['B04', 'B08'],
+    'EVI': ['B04', 'B08', 'B02'],
+    'EVI2': ['B04', 'B08'],
+    'SAVI': ['B04', 'B08'],
+    'MSAVI': ['B04', 'B08'],
+    'NDMI': ['B08', 'B11'],
+    'NDWI': ['B03', 'B11'],
+    'SMI': ['B08', 'B11'],
+    'CCC': ['B03', 'B04', 'B05'],
+    'NITROGEN': ['B04', 'B05'],
+    'SOC': ['B03', 'B04', 'B11', 'B12'],
+    'NDRE': ['B8A', 'B05'],
+    'RECI': ['B08', 'B05'],
+    'TRUE_COLOR': ['B04', 'B03', 'B02'],
+    # Sentinel-1 radar indices (cloudy-day / all-weather)
+    'VV': ['VV'],                 # soil moisture, flooding (dB)
+    'VH': ['VH'],                 # crop biomass, canopy (dB)
+    'VV_VH': ['VV', 'VH'],        # crop structure
+    'VH_VV': ['VV', 'VH'],        # crop growth
+    'RVI': ['VV', 'VH'],          # vegetation vigor
+    'SDWI': ['VV', 'VH'],         # waterlogging
+    'SIGMA0_VV': ['VV'],          # σ⁰ VV (dB)
+    'SIGMA0_VH': ['VH'],          # σ⁰ VH (dB)
+    'GAMMA0_VV': ['VV'],          # γ⁰ VV (dB) — RTC native
+    'GAMMA0_VH': ['VH'],          # γ⁰ VH (dB) — RTC native
+}
+# Canonical S1 names for error messages (exclude legacy aliases already normalized away)
+S1_PUBLIC_INDICES = [
+    "VV", "VH", "VV_VH", "VH_VV", "RVI", "SDWI",
+    "SIGMA0_VV", "SIGMA0_VH", "GAMMA0_VV", "GAMMA0_VH",
+]
+
+
+def resolve_index(index_name: str, satellite: str):
+    """Normalise the index name and validate it against the satellite.
+
+    Returns (index_name, required_bands); raises HTTP 400 for unknown or
+    mismatched indices.
+    """
+    index_name = index_name.upper()
+    if utils.is_s1_index(index_name):
+        index_name = utils.normalize_s1_index(index_name)
+    is_s1 = satellite.startswith("s1")
+    if is_s1 and utils.is_optical_index(index_name):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Index {index_name} is not available for Sentinel-1 (radar). Use Sentinel-2 (s2) for optical indices."
+        )
+    if (not is_s1) and utils.is_s1_index(index_name):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Index {index_name} requires Sentinel-1 (radar). Set satellite to \"s1\"."
+        )
+    if index_name not in INDEX_BAND_MAP:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported index: {index_name}. "
+                f"S2 optical: {[k for k in INDEX_BAND_MAP if k not in utils.S1_INDICES]}. "
+                f"S1 radar: {S1_PUBLIC_INDICES}."
+            ),
+        )
+    return index_name, INDEX_BAND_MAP[index_name]
+
+
+
+def render_index_result(index_name, index_arr, aoi_mask, res_m, geom, dst_transform, target_crs,
+                        W, H, width, height, supersample, smooth, gaussian_sigma, date_str,
+                        png_optimize=True):
+    """Colour-classify an index array into the PNG + legend + area-stats response."""
+    validvals = index_arr[np.isfinite(index_arr) & aoi_mask]
+    if validvals.size == 0:
+        raise HTTPException(status_code=424, detail="Index has no valid pixels after masking")
+
+    if index_name in utils.index_palettes_labels:
+        palette = utils.index_palettes_labels[index_name]['palette']
+        labels = utils.index_palettes_labels[index_name]['labels']
+    else:
+        palette, labels = utils.PALETTE_MAP.get(index_name, (utils.PALETTE, utils.LABELS))
+    max_data_bin = max(1, len(palette) - 1)
+    index_edges = utils.get_index_edges(index_name)
+
+    bins_full = utils.ndvi_to_bins(index_arr, max_bin=max_data_bin, edges=index_edges)
+    NDVI_canvas = index_arr
+
+    # Pass AOI geometry, transform, and CRS for proper masking
+    img_b64 = utils.render_spread_png_fast(
+        bins_full, NDVI_canvas, res_m,
+        supersample, smooth, gaussian_sigma,
+        width, height, palette=palette, labels=labels,
+        nodata_transparent=True,
+        aoi_ll_geojson=geom,
+        transform=dst_transform,
+        crs=target_crs,
+        max_bin=max_data_bin,
+        edges=index_edges,
+        png_optimize=png_optimize,
+    )
+
+    legend = []
+    for i in range(min(len(palette), len(labels))):
+        legend.append({"color": palette[i], "label": labels[i]})
+    for i in range(len(legend), len(palette)):
+        legend.append({"color": palette[i], "label": f"bin_{i}"})
+
+    bounds = utils.compute_bounds_wgs84(dst_transform, W, H, target_crs)
+
+    pix_area_m2 = res_m * res_m
+    area_stats = []
+    aoi_pixel_count = int(np.count_nonzero(aoi_mask))
+    max_bin = int(np.max(bins_full)) if bins_full.size > 0 else 0
+    for bin_idx in range(0, max_bin + 1):
+        if bin_idx == 0:
+            label = "No Data"
+        else:
+            label = labels[bin_idx] if bin_idx < len(labels) else f"bin_{bin_idx}"
+        cnt = int(np.count_nonzero((bins_full == bin_idx) & aoi_mask))
+        ha = (cnt * pix_area_m2) / 10000.0
+        pct = (cnt / float(max(aoi_pixel_count, 1))) * 100.0
+        area_stats.append({"label": label, "hectares": round(float(ha), 4), "percent": round(float(pct), 2)})
+
+    area_map = {a["label"]: a for a in area_stats}
+    merged_legend = []
+    for entry in legend:
+        lbl = entry.get("label")
+        am = area_map.get(lbl, {"hectares": 0.0, "percent": 0.0})
+        merged_legend.append({
+            "color": entry.get("color"),
+            "label": lbl,
+            "hectares": am.get("hectares", 0.0),
+            "percent": am.get("percent", 0.0)
+        })
+
+    # Summary of the same masked pixels the image is drawn from, so callers can compare
+    # fields and dates numerically (village health summaries, change between dates).
+    stats = {
+        "mean": round(float(np.mean(validvals)), 4),
+        "median": round(float(np.median(validvals)), 4),
+        "min": round(float(np.min(validvals)), 4),
+        "max": round(float(np.max(validvals)), 4),
+        "p10": round(float(np.percentile(validvals, 10)), 4),
+        "p90": round(float(np.percentile(validvals, 90)), 4),
+        "valid_pct": round(100.0 * validvals.size / float(max(aoi_pixel_count, 1)), 2),
+    }
+
+    return {
+        "date": date_str,
+        "index_name": index_name,
+        "image_base64": img_b64,
+        "bounds": bounds,
+        "legend": merged_legend,
+        "stats": stats,
+    }
+
+
 @router.post("/index", response_model=CalculateResponse)
 def calculate_index(req: CalculateRequest):
     start_time = time.time()
@@ -67,62 +223,7 @@ def calculate_index(req: CalculateRequest):
     prefer_pc = search_order[0] == "planetary"
     is_s1 = satellite.startswith("s1")
 
-    if utils.is_s1_index(index_name):
-        index_name = utils.normalize_s1_index(index_name)
-
-    if is_s1 and utils.is_optical_index(index_name):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Index {index_name} is not available for Sentinel-1 (radar). Use Sentinel-2 (s2) for optical indices."
-        )
-    if (not is_s1) and utils.is_s1_index(index_name):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Index {index_name} requires Sentinel-1 (radar). Set satellite to \"s1\"."
-        )
-
-    index_band_map = {
-        'NDVI': ['B04', 'B08'],
-        'EVI': ['B04', 'B08', 'B02'],
-        'EVI2': ['B04', 'B08'],
-        'SAVI': ['B04', 'B08'],
-        'MSAVI': ['B04', 'B08'],
-        'NDMI': ['B08', 'B11'],
-        'NDWI': ['B03', 'B11'],
-        'SMI': ['B08', 'B11'],
-        'CCC': ['B03', 'B04', 'B05'],
-        'NITROGEN': ['B04', 'B05'],
-        'SOC': ['B03', 'B04', 'B11', 'B12'],
-        'NDRE': ['B8A', 'B05'],
-        'RECI': ['B08', 'B05'],
-        'TRUE_COLOR': ['B04', 'B03', 'B02'],
-        # Sentinel-1 radar indices (cloudy-day / all-weather)
-        'VV': ['VV'],                 # soil moisture, flooding (dB)
-        'VH': ['VH'],                 # crop biomass, canopy (dB)
-        'VV_VH': ['VV', 'VH'],        # crop structure
-        'VH_VV': ['VV', 'VH'],        # crop growth
-        'RVI': ['VV', 'VH'],          # vegetation vigor
-        'SDWI': ['VV', 'VH'],         # waterlogging
-        'SIGMA0_VV': ['VV'],          # σ⁰ VV (dB)
-        'SIGMA0_VH': ['VH'],          # σ⁰ VH (dB)
-        'GAMMA0_VV': ['VV'],          # γ⁰ VV (dB) — RTC native
-        'GAMMA0_VH': ['VH'],          # γ⁰ VH (dB) — RTC native
-    }
-    # Canonical S1 names for error messages (exclude legacy aliases already normalized away)
-    s1_public = [
-        "VV", "VH", "VV_VH", "VH_VV", "RVI", "SDWI",
-        "SIGMA0_VV", "SIGMA0_VH", "GAMMA0_VV", "GAMMA0_VH",
-    ]
-    if index_name not in index_band_map:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Unsupported index: {index_name}. "
-                f"S2 optical: {[k for k in index_band_map if k not in utils.S1_INDICES]}. "
-                f"S1 radar: {s1_public}."
-            ),
-        )
-    required_bands = index_band_map[index_name]
+    index_name, required_bands = resolve_index(index_name, satellite)
 
     cache_key = _request_cache_key(req, index_name)
     cached = _RESPONSE_CACHE.get(cache_key)
@@ -376,75 +477,10 @@ def calculate_index(req: CalculateRequest):
             })
         # ---- END TRUE_COLOR ----
 
-        validvals = index_arr[np.isfinite(index_arr) & aoi_mask]
-        if validvals.size == 0:
-            raise HTTPException(status_code=424, detail="Index has no valid pixels after masking")
-
-        if index_name in utils.index_palettes_labels:
-            palette = utils.index_palettes_labels[index_name]['palette']
-            labels = utils.index_palettes_labels[index_name]['labels']
-        else:
-            palette, labels = utils.PALETTE_MAP.get(index_name, (utils.PALETTE, utils.LABELS))
-        max_data_bin = max(1, len(palette) - 1)
-        index_edges = utils.get_index_edges(index_name)
-
-        bins_full = utils.ndvi_to_bins(index_arr, max_bin=max_data_bin, edges=index_edges)
-        NDVI_canvas = index_arr
-
-        # Pass AOI geometry, transform, and CRS for proper masking
-        img_b64 = utils.render_spread_png_fast(
-            bins_full, NDVI_canvas, res_m,
-            supersample, smooth, gaussian_sigma,
-            width, height, palette=palette, labels=labels,
-            nodata_transparent=True,
-            aoi_ll_geojson=geom,
-            transform=dst_transform,
-            crs=target_crs,
-            max_bin=max_data_bin,
-            edges=index_edges
-        )
-
-        legend = []
-        for i in range(min(len(palette), len(labels))):
-            legend.append({"color": palette[i], "label": labels[i]})
-        for i in range(len(legend), len(palette)):
-            legend.append({"color": palette[i], "label": f"bin_{i}"})
-
-        bounds = utils.compute_bounds_wgs84(dst_transform, W, H, target_crs)
-
-        pix_area_m2 = res_m * res_m
-        area_stats = []
-        aoi_pixel_count = int(np.count_nonzero(aoi_mask))
-        max_bin = int(np.max(bins_full)) if bins_full.size > 0 else 0
-        for bin_idx in range(0, max_bin + 1):
-            if bin_idx == 0:
-                label = "No Data"
-            else:
-                label = labels[bin_idx] if bin_idx < len(labels) else f"bin_{bin_idx}"
-            cnt = int(np.count_nonzero((bins_full == bin_idx) & aoi_mask))
-            ha = (cnt * pix_area_m2) / 10000.0
-            pct = (cnt / float(max(aoi_pixel_count, 1))) * 100.0
-            area_stats.append({"label": label, "hectares": round(float(ha), 4), "percent": round(float(pct), 2)})
-
-        area_map = {a["label"]: a for a in area_stats}
-        merged_legend = []
-        for entry in legend:
-            lbl = entry.get("label")
-            am = area_map.get(lbl, {"hectares": 0.0, "percent": 0.0})
-            merged_legend.append({
-                "color": entry.get("color"),
-                "label": lbl,
-                "hectares": am.get("hectares", 0.0),
-                "percent": am.get("percent", 0.0)
-            })
-
-        return _RESPONSE_CACHE.set(cache_key, {
-            "date": date_str,
-            "index_name": index_name,
-            "image_base64": img_b64,
-            "bounds": bounds,
-            "legend": merged_legend
-        })
+        return _RESPONSE_CACHE.set(cache_key, render_index_result(
+            index_name, index_arr, aoi_mask, res_m, geom, dst_transform, target_crs,
+            W, H, width, height, supersample, smooth, gaussian_sigma, date_str,
+        ))
 
     except HTTPException:
         raise

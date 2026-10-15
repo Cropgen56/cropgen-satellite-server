@@ -1081,7 +1081,10 @@ def pick_best_item(aoi_geojson, start, end, prefer_pc=True, satellite="s2"):
     return best[1], best[2], _item_collection_id(best[1])
 
 # read tile
-def _read_tile_into_stack(item, aoi_geojson, dst_transform, H, W, want_scl, required_bands=None):
+def _read_tile_into_stack(item, aoi_geojson, dst_transform, H, W, want_scl, required_bands=None,
+                          open_dataset=None):
+    # open_dataset(url) lets batch callers serve band reads from memory; defaults to rasterio.open.
+    open_dataset = open_dataset or rasterio.open
     out = {"used": False, "bands": {}, "S": None, "id": getattr(item, "id", None)}
     assets = item.assets or {}
     required_bands = list(dict.fromkeys(required_bands or ["B04", "B08"]))
@@ -1131,7 +1134,7 @@ def _read_tile_into_stack(item, aoi_geojson, dst_transform, H, W, want_scl, requ
 
             S = None
             if scl_url:
-                with rasterio.open(scl_url) as scl:
+                with open_dataset(scl_url) as scl:
                     S = read_scl_window(scl, aoi_sc, H, W, dst_transform)
             out["S"] = S
 
@@ -1140,7 +1143,7 @@ def _read_tile_into_stack(item, aoi_geojson, dst_transform, H, W, want_scl, requ
                 if not url:
                     return bkey, None
                 try:
-                    with rasterio.open(url) as ds:
+                    with open_dataset(url) as ds:
                         arr = read_band_window(ds, aoi_sc, H, W, dst_transform, Resampling.bilinear)
                         if is_radar:
                             # RTC: float gamma0 with nodata ~-32768. GRD: uint16 DN, 0=nodata.
@@ -1204,7 +1207,8 @@ def render_spread_png_fast(bins_canvas: np.ndarray, NDVI_canvas: np.ndarray, res
                            out_w: int, out_h: int, palette: Optional[List[str]] = None,
                            labels: Optional[List[str]] = None, nodata_transparent: bool = True,
                            aoi_ll_geojson: Optional[dict] = None, transform: Optional[Affine] = None,
-                           crs = None, max_bin: int = 10, edges: Optional[np.ndarray] = None) -> str:
+                           crs = None, max_bin: int = 10, edges: Optional[np.ndarray] = None,
+                           png_optimize: bool = True) -> str:
     if palette is None:
         palette = PALETTE
     if labels is None:
@@ -1299,10 +1303,13 @@ def render_spread_png_fast(bins_canvas: np.ndarray, NDVI_canvas: np.ndarray, res
     pil = pil.resize((out_w, out_h), resample=Image.LANCZOS)
     buf = io.BytesIO()
     # RGBA mode automatically handles transparency via alpha channel
-    pil.save(buf, format="PNG", optimize=True)
+    # optimize=False gives the same pixels in a slightly larger file, much faster (batch use).
+    pil.save(buf, format="PNG", optimize=png_optimize)
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
-def temporal_fill_median(band_key: str, items: List[Any], aoi_geojson, dst_transform, H, W, want_scl=False, max_items=6):
+def temporal_fill_median(band_key: str, items: List[Any], aoi_geojson, dst_transform, H, W, want_scl=False, max_items=6,
+                         open_dataset=None):
+    open_dataset = open_dataset or rasterio.open
     stacks = []
     is_radar = (band_key or "").upper() in S1_BANDS
 
@@ -1315,7 +1322,7 @@ def temporal_fill_median(band_key: str, items: List[Any], aoi_geojson, dst_trans
         url = sign_href_if_pc(url)
         try:
             with rasterio.Env():
-                with rasterio.open(url) as ds:
+                with open_dataset(url) as ds:
                     arr = read_band_window(
                         ds,
                         aoi_to_scene_cached(aoi_geojson, ds.crs.to_string()),

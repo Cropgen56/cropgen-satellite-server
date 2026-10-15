@@ -2,6 +2,7 @@ import os
 
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from dotenv import load_dotenv
 
 load_dotenv(override=True)  # override=True ensures .env always wins over shell/conda env vars
@@ -61,6 +62,9 @@ env_origins = [
 ]
 
 origins = list(dict.fromkeys(default_origins + env_origins))
+
+# Index responses carry base64 PNGs for every field; gzip roughly offsets the base64 overhead.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 app.add_middleware(
     CORSMiddleware,
