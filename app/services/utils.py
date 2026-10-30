@@ -1,9 +1,9 @@
 import os
 import io
+import logging
 import json
 import base64
 import math
-import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from contextlib import nullcontext
@@ -34,6 +34,10 @@ import planetary_computer
 # plotting / image
 from PIL import Image
 
+from app.services.response_cache import TTLCache
+
+log = logging.getLogger("satellite.utils")
+
 # ---------- Environment / tuning ----------
 os.environ.setdefault("CPL_VSIL_CURL_USE_HEAD", "FALSE")
 os.environ.setdefault("GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR")
@@ -44,6 +48,10 @@ os.environ.setdefault("GDAL_HTTP_MERGE_CONSECUTIVE_RANGES", "YES")
 os.environ.setdefault("VSI_CACHE", "TRUE")
 os.environ.setdefault("VSI_CACHE_SIZE", "25000000")
 os.environ.setdefault("GDAL_CACHEMAX", "1024")
+# Bound every COG request so a stalled provider fails the read instead of hanging the worker.
+os.environ.setdefault("GDAL_HTTP_TIMEOUT", "30")
+os.environ.setdefault("GDAL_HTTP_MAX_RETRY", "3")
+os.environ.setdefault("GDAL_HTTP_RETRY_DELAY", "1")
 
 EARTH_SEARCH_AWS = "https://earth-search.aws.element84.com/v1"
 PLANETARY_STAC = "https://planetarycomputer.microsoft.com/api/stac/v1"
@@ -91,8 +99,8 @@ BAND_ASSET_ALIASES = {
 THREADS = min(16, max(8, (os.cpu_count() or 4) * 2))
 
 # Short-lived caches for repeated reads within a warm process.
-_KEEP_PCT_CACHE: Dict[str, Tuple[float, float, bool]] = {}
-_KEEP_PCT_CACHE_TTL = 30 * 60
+# Bounded so a long-running worker does not grow without limit.
+_KEEP_PCT_CACHE = TTLCache(ttl_seconds=30 * 60, max_entries=4096)
 
 # Best-effort diagnostics to explain provider fallback failures.
 _PROVIDER_ERRORS: Dict[str, str] = {}
@@ -160,9 +168,7 @@ AWS_STAC_METADATA_FIELDS = {
 
 # Search results are shared across endpoints (availability, timeseries and
 # index maps usually hit the same field + dates back to back).
-_SEARCH_CACHE: Dict[str, Tuple[float, List[Any]]] = {}
-_SEARCH_CACHE_TTL = 5 * 60
-_SEARCH_CACHE_MAX = 256
+_SEARCH_CACHE = TTLCache(ttl_seconds=5 * 60, max_entries=256)
 # Long-lived pool so a slow fallback provider never blocks the response.
 _SEARCH_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="stac-search")
 
@@ -187,10 +193,9 @@ def search_stac_items(
     cache_key = json.dumps(
         [collections, intersects, dt, limit, unique_order, metadata_only], sort_keys=True, default=str
     )
-    now = time.time()
     cached = _SEARCH_CACHE.get(cache_key)
-    if cached and now - cached[0] < _SEARCH_CACHE_TTL:
-        return list(cached[1])
+    if cached is not None:
+        return list(cached)
 
     futures = {
         provider: _SEARCH_POOL.submit(
@@ -204,11 +209,13 @@ def search_stac_items(
         items = futures[provider].result() or []
         if items:
             break
+        if _PROVIDER_ERRORS.get(provider):
+            # Scenes from another provider can differ slightly (processing baseline), so make it visible.
+            log.warning("STAC search on %s failed (%s); trying the next provider",
+                        provider, _PROVIDER_ERRORS[provider])
 
     if items:
-        if len(_SEARCH_CACHE) >= _SEARCH_CACHE_MAX:
-            _SEARCH_CACHE.pop(next(iter(_SEARCH_CACHE)), None)
-        _SEARCH_CACHE[cache_key] = (now, list(items))
+        _SEARCH_CACHE.set(cache_key, list(items))
     return items
 
 
@@ -927,10 +934,9 @@ def quick_keep_pct(item, aoi_geojson):
     item_id = getattr(item, "id", None) or ""
     geom_key = json.dumps(aoi_geojson, sort_keys=True)
     cache_key = f"{item_id}|{hash(geom_key)}"
-    now = time.time()
     cached = _KEEP_PCT_CACHE.get(cache_key)
-    if cached and now - cached[0] < _KEEP_PCT_CACHE_TTL:
-        return cached[1], cached[2]
+    if cached is not None:
+        return cached
 
     assets = item.assets
     red = prefer_http_from_asset(assets.get("red") or assets.get("B04"))
@@ -978,7 +984,7 @@ def quick_keep_pct(item, aoi_geojson):
                 kept = np.count_nonzero(np.isfinite(nd) & mask)
                 total = np.count_nonzero(mask)
                 result = (kept / max(total, 1)) * 100.0, bool(sds)
-                _KEEP_PCT_CACHE[cache_key] = (now, result[0], result[1])
+                _KEEP_PCT_CACHE.set(cache_key, result)
                 return result
     except Exception:
         return 0.0, False
@@ -989,10 +995,9 @@ def quick_keep_pct_s1(item, aoi_geojson):
     item_id = getattr(item, "id", None) or ""
     geom_key = json.dumps(aoi_geojson, sort_keys=True)
     cache_key = f"s1|{item_id}|{hash(geom_key)}"
-    now = time.time()
     cached = _KEEP_PCT_CACHE.get(cache_key)
-    if cached and now - cached[0] < _KEEP_PCT_CACHE_TTL:
-        return cached[1], cached[2]
+    if cached is not None:
+        return cached
 
     assets = item.assets or {}
     vv_asset = resolve_asset(assets, "VV")
@@ -1016,7 +1021,7 @@ def quick_keep_pct_s1(item, aoi_geojson):
                 kept = np.count_nonzero(valid)
                 total = np.count_nonzero(mask)
                 result = (kept / max(total, 1)) * 100.0, False
-                _KEEP_PCT_CACHE[cache_key] = (now, result[0], result[1])
+                _KEEP_PCT_CACHE.set(cache_key, result)
                 return result
     except Exception:
         return 0.0, False

@@ -1,3 +1,4 @@
+import logging
 import os
 
 from fastapi import Depends, FastAPI
@@ -6,6 +7,12 @@ from fastapi.middleware.gzip import GZipMiddleware
 from dotenv import load_dotenv
 
 load_dotenv(override=True)  # override=True ensures .env always wins over shell/conda env vars
+
+# App loggers (request timings, field failures) go to stderr next to uvicorn's own logs.
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 from app.routers.availability_dates_api import router as availability_router
 from app.routers.calculate_index_api import router as calculate_router

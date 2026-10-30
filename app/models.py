@@ -68,11 +68,12 @@ class MultiCalculateRequest(BaseModel):
     index_name: str
     provider: Optional[str] = "both"
     satellite: Optional[str] = "s2"
-    width: Optional[int] = 800
-    height: Optional[int] = 800
-    supersample: Optional[int] = 1
+    # Bounded: every field gets its own width x height image in the response.
+    width: Optional[int] = Field(800, ge=16, le=2048)
+    height: Optional[int] = Field(800, ge=16, le=2048)
+    supersample: Optional[int] = Field(1, ge=1, le=4)
     smooth: Optional[bool] = False
-    gaussian_sigma: Optional[float] = 1.0
+    gaussian_sigma: Optional[float] = Field(1.0, ge=0, le=10)
 
 class MultiCalculateResult(BaseModel):
     id: str

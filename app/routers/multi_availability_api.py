@@ -4,7 +4,10 @@ One STAC search covers every field (over the convex hull of all polygons); each
 scene is then matched back to the fields it actually intersects, so a date is
 listed with exactly the fields it covers.
 """
+import hashlib
 import json
+import logging
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -19,15 +22,19 @@ from app.services.response_cache import TTLCache
 from app.services.feature_collection import parse_feature_collection
 
 router = APIRouter()
+log = logging.getLogger("multi.availability")
 
 # STAC page size (all pages are still fetched). Planetary rejects pages above 1000.
 AVAILABILITY_SEARCH_LIMIT = 500
 RESPONSE_CACHE_TTL_SECONDS = 10 * 60
 _RESPONSE_CACHE = TTLCache(ttl_seconds=RESPONSE_CACHE_TTL_SECONDS, max_entries=256)
+# Longer ranges page through thousands of scenes; the dashboard asks for ~60 days.
+MAX_RANGE_DAYS = 731
 
 
 def _request_cache_key(req: MultiAvailabilityRequest) -> str:
-    return json.dumps(
+    # Hashed: the raw key would keep a copy of every cached FeatureCollection in memory.
+    raw = json.dumps(
         {
             "geojson": req.geojson,
             "start_date": req.start_date,
@@ -37,6 +44,7 @@ def _request_cache_key(req: MultiAvailabilityRequest) -> str:
         },
         sort_keys=True,
     )
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 def _item_cloud(it: Any) -> Optional[float]:
@@ -50,17 +58,23 @@ def _item_cloud(it: Any) -> Optional[float]:
 @router.post("/", response_model=MultiAvailabilityResponse)
 def multi_availability(req: MultiAvailabilityRequest):
     try:
-        datetime.strptime(req.start_date, "%Y-%m-%d")
-        datetime.strptime(req.end_date, "%Y-%m-%d")
+        start = datetime.strptime(req.start_date, "%Y-%m-%d")
+        end = datetime.strptime(req.end_date, "%Y-%m-%d")
     except Exception:
         raise HTTPException(status_code=400, detail="start_date and end_date must be YYYY-MM-DD")
+    if end < start:
+        raise HTTPException(status_code=400, detail="end_date must not be before start_date")
+    if (end - start).days > MAX_RANGE_DAYS:
+        raise HTTPException(status_code=400, detail=f"Date range must be at most {MAX_RANGE_DAYS} days")
 
-    features = parse_feature_collection(req.geojson)
-
+    # A cached answer was validated when it was computed, so skip parsing on a hit.
     cache_key = _request_cache_key(req)
     cached = _RESPONSE_CACHE.get(cache_key)
     if cached is not None:
         return cached
+
+    t0 = time.monotonic()
+    features = parse_feature_collection(req.geojson)
 
     collections = utils.get_collections_for_satellite(req.satellite or "s2")
     search_order = utils.get_provider_search_order(req.provider, prefer_pc_default=True)
@@ -98,7 +112,8 @@ def multi_availability(req: MultiAvailabilityRequest):
             best, covered = by_date.get(date_key, (None, set()))
             if cloud is not None and (best is None or cloud < best):
                 best = cloud
-            by_date[date_key] = (best, covered | hit)
+            covered.update(hit)
+            by_date[date_key] = (best, covered)
 
         items: List[MultiAvailabilityItem] = []
         for d, (best, covered) in sorted(by_date.items()):
@@ -106,8 +121,11 @@ def multi_availability(req: MultiAvailabilityRequest):
             items.append(MultiAvailabilityItem(
                 date=d, cloud_cover=best, feature_count=len(ids), feature_ids=ids,
             ))
+        log.info("multi availability: %d fields, %d scenes, %d dates in %.2fs",
+                 len(features), len(all_items), len(items), time.monotonic() - t0)
         return _RESPONSE_CACHE.set(cache_key, {"total_features": len(features), "items": items})
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        log.exception("multi availability failed for %d fields", len(features))
+        raise HTTPException(status_code=500, detail="Availability search failed; please retry")
