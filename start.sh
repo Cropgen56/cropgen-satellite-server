@@ -14,4 +14,4 @@ cd ~/cropgen-satellite-apis
 # if [ -f .env ]; then export $(grep -v '^#' .env | xargs); fi
 
 # run uvicorn (change main:app or port if needed)
-exec uvicorn main:app --host 127.0.0.1 --port 8001 --workers 4 --proxy-headers
+exec uvicorn main:app --host 127.0.0.1 --port 8003 --workers 4 --proxy-headers
